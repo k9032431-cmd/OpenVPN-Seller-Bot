@@ -23,7 +23,7 @@ while true; do
 	echo "  4) Остановить бота"
 	echo "  5) Обновить бота"
 	echo "  6) Изменить настройки (токен, админ, поддержка)"
-	echo "  7) Меню OpenVPN (скрипт установки)"
+	echo "  7) Меню OpenVPN на этом сервере (скрипт)"
 	echo "  8) Удалить бота"
 	echo "  0) Выход"
 	echo
@@ -36,6 +36,7 @@ while true; do
 	5) bash "$DIR/install.sh"; pause ;;
 	6) bash "$DIR/install.sh" --reconfigure; pause ;;
 	7)
+		[[ -e /etc/openvpn/server.conf ]] || { echo "На этом сервере OpenVPN не установлен. Серверы добавляются в боте: 🖥 Серверы."; pause; continue; }
 		echo "Совет: ключи удобнее создавать в боте. Созданные здесь ключи бот подхватит сам."
 		bash "$DIR/scripts/openvpn-install.sh"
 		systemctl restart "$SERVICE"

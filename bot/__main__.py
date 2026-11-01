@@ -3,83 +3,72 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from aiogram.types import BotCommand, BotCommandScopeDefault
 
 from . import services
 from .config import load_config
 from .db import DB
+from .fleet import Fleet
 from .handlers import admin_keyboard, build_admin_router, build_user_router
 from .openvpn import OpenVPN
+from .remote import LocalExecutor
 
-USER_COMMANDS = [
-    BotCommand(command="start", description="Меню"),
-    BotCommand(command="key", description="Получить мой ключ"),
-]
-ADMIN_COMMANDS = USER_COMMANDS + [
-    BotCommand(command="new", description="Создать ключ: имя [дней] [заметка]"),
-    BotCommand(command="list", description="Все ключи"),
-    BotCommand(command="info", description="Инфо о ключе"),
-    BotCommand(command="get", description="Получить .ovpn"),
-    BotCommand(command="link", description="Новая ссылка для ключа"),
-    BotCommand(command="extend", description="Продлить: имя дней"),
-    BotCommand(command="revoke", description="Отключить ключ"),
-    BotCommand(command="sync", description="Импорт ключей из easy-rsa"),
-    BotCommand(command="ip", description="IP сервера"),
-    BotCommand(command="setip", description="Сменить адрес и разослать ключи"),
-    BotCommand(command="push", description="Разослать ключи всем"),
-    BotCommand(command="broadcast", description="Сообщение всем клиентам"),
-    BotCommand(command="help", description="Помощь"),
-]
+
+async def register_local_server(db: DB) -> None:
+    """Если OpenVPN стоит на этом же сервере, что и бот, — добавить его автоматически."""
+    if db.local_server() is not None or not os.path.exists("/etc/openvpn/server.conf"):
+        return
+    o = OpenVPN(LocalExecutor())
+    ip = await o.public_ip() or "localhost"
+    sid = db.add_server("Этот сервер", "local", ip)
+    db.assign_orphans(sid)  # ключи из прошлой версии бота
+    logging.info("Добавлен локальный сервер (%s)", ip)
 
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("asyncssh").setLevel(logging.WARNING)
     cfg = load_config()
-    ovpn = OpenVPN(cfg.openvpn_dir, cfg.easyrsa_dir)
-    ovpn.check()
     db = DB(cfg.db_path)
+    await register_local_server(db)
+    fleet = Fleet(db, Path(cfg.data_dir) / "ssh_key")
 
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
-
-    await bot.set_my_commands(USER_COMMANDS, scope=BotCommandScopeDefault())
-    for admin in cfg.admin_ids:
-        try:
-            await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin))
-        except Exception as e:  # админ ещё не писал боту
-            logging.warning("Не удалось задать команды для %s: %s", admin, e)
+    await bot.set_my_commands([BotCommand(command="start", description="Меню"),
+                               BotCommand(command="key", description="Получить мой ключ")],
+                              scope=BotCommandScopeDefault())
 
     dp = Dispatcher()
     dp.include_router(build_admin_router(cfg))
     dp.include_router(build_user_router())
 
-    tasks = [asyncio.create_task(services.expiry_loop(bot, db, ovpn, cfg))]
-    if cfg.ip_auto_update:
-        tasks.append(asyncio.create_task(services.ip_watch_loop(bot, db, ovpn, cfg)))
-
-    added, _ = services.sync_from_easyrsa(db, ovpn)
-    host, port = ovpn.get_remote()
-    logging.info("Бот @%s запущен. Адрес в ключах: %s:%s", me.username, host, port)
-    for admin in cfg.admin_ids:
+    for s in db.servers():
         try:
-            await bot.send_message(
-                admin,
-                f"✅ Бот запущен. Адрес сервера в ключах: <code>{host}:{port}</code>\n"
-                + (f"Найдено ключей, созданных скриптом: {len(added)}\n" if added else "")
-                + "Нажмите «❓ Как это работает», если впервые.",
-                reply_markup=admin_keyboard(),
-            )
-        except Exception as e:
-            logging.warning("Не удалось написать админу %s: %s", admin, e)
+            await services.sync(db, fleet, s["id"])
+        except services.ERRORS as e:
+            logging.warning("Сервер %s недоступен: %s", s["name"], e)
+
+    tasks = [asyncio.create_task(services.expiry_loop(bot, db, fleet, cfg)),
+             asyncio.create_task(services.watch_loop(bot, db, fleet, cfg))]
+
+    n = len(db.servers())
+    logging.info("Бот @%s запущен, серверов: %d", me.username, n)
+    hint = ("Начните с «🖥 Серверы» → «➕ Добавить сервер»." if n == 0
+            else f"Серверов: {n}. Нажмите «❓ Как это работает», если впервые.")
+    await services.notify_admins(bot, cfg, f"✅ Бот запущен. {hint}", reply_markup=admin_keyboard())
     try:
-        await dp.start_polling(bot, db=db, ovpn=ovpn, cfg=cfg, bot_username=me.username)
+        await dp.start_polling(bot, db=db, fleet=fleet, cfg=cfg, bot_username=me.username)
     finally:
         for t in tasks:
             t.cancel()
+        await fleet.close()
         await bot.session.close()
 
 

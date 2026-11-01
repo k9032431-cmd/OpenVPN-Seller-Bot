@@ -27,8 +27,7 @@ class Config:
     bot_token: str
     admin_ids: frozenset[int]
     support_contact: str
-    openvpn_dir: str
-    easyrsa_dir: str
+    data_dir: str
     db_path: str
     ip_auto_update: bool
     ip_check_interval: int
@@ -39,7 +38,7 @@ class Config:
 def load_config() -> Config:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
-        raise SystemExit("BOT_TOKEN не задан. Заполните файл .env (см. .env.example).")
+        raise SystemExit("BOT_TOKEN не задан. Запустите на сервере: vpnbot → «Изменить настройки».")
 
     admins = frozenset(
         int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
@@ -47,13 +46,13 @@ def load_config() -> Config:
     if not admins:
         raise SystemExit("ADMIN_IDS не задан. Укажите свой Telegram ID в .env.")
 
-    openvpn_dir = os.getenv("OPENVPN_DIR", "/etc/openvpn").rstrip("/")
+    data_dir = os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent / "data"))
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
     return Config(
         bot_token=token,
         admin_ids=admins,
         support_contact=os.getenv("SUPPORT_CONTACT", "").strip(),
-        openvpn_dir=openvpn_dir,
-        easyrsa_dir=os.getenv("EASYRSA_DIR", f"{openvpn_dir}/easy-rsa").rstrip("/"),
+        data_dir=data_dir,
         db_path=os.getenv("DB_PATH", str(Path(__file__).resolve().parent.parent / "bot.db")),
         ip_auto_update=_bool("IP_AUTO_UPDATE", True),
         ip_check_interval=max(15, _int("IP_CHECK_INTERVAL", 60)),

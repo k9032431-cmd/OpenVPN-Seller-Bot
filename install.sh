@@ -7,9 +7,11 @@
 #  Что делает:
 #    1. ставит нужные программы (git, python3)
 #    2. скачивает бота в /opt/openvpn-seller-bot
-#    3. ставит OpenVPN, если его ещё нет
-#    4. спрашивает токен бота и сам узнаёт ваш Telegram ID
-#    5. запускает бота как сервис (сам стартует после перезагрузки)
+#    3. спрашивает токен бота и сам узнаёт ваш Telegram ID
+#    4. запускает бота как сервис (сам стартует после перезагрузки)
+#
+#  Серверы и OpenVPN добавляются уже в самом боте: «🖥 Серверы» → «➕ Добавить сервер».
+#  Ставить бота можно на любой VPS — хоть на один из VPN-серверов, хоть на отдельный.
 #
 #  Повторный запуск = обновление (настройки сохраняются).
 #  Изменить настройки:  vpnbot   (или: bash install.sh --reconfigure)
@@ -36,7 +38,7 @@ SRC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 [[ -f "$SRC/bot/__main__.py" ]] && DIR="$SRC"
 
 # ---------- 1. программы ----------
-step "1/5  Устанавливаю нужные программы"
+step "1/4  Устанавливаю нужные программы"
 if command -v apt-get >/dev/null; then
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -qq
@@ -51,7 +53,7 @@ fi
 ok "Готово"
 
 # ---------- 2. код бота ----------
-step "2/5  Скачиваю бота"
+step "2/4  Скачиваю бота"
 if [[ -d "$DIR/.git" ]]; then
 	git -C "$DIR" pull -q --ff-only || warn "Не удалось обновить код, продолжаю с текущим"
 elif [[ ! -f "$DIR/bot/__main__.py" ]]; then
@@ -65,28 +67,8 @@ python3 -m venv .venv
 ln -sf "$DIR/vpnbot.sh" /usr/local/bin/vpnbot
 ok "Бот в папке $DIR"
 
-# ---------- 3. OpenVPN ----------
-step "3/5  OpenVPN"
-if [[ -e /etc/openvpn/server.conf ]]; then
-	ok "OpenVPN уже установлен"
-else
-	echo "OpenVPN ещё не установлен."
-	echo "  1) Установить автоматически (рекомендуется: порт 1194, UDP, AdGuard DNS)"
-	echo "  2) Установить вручную — ответить на вопросы скрипта"
-	CHOICE=$(ask "Выберите [1-2, по умолчанию 1]: ")
-	if [[ $CHOICE == "2" ]]; then
-		bash scripts/openvpn-install.sh </dev/tty || true
-	else
-		PUBLIC_IP=$(curl -4 -s --max-time 10 https://api.ipify.org || true)
-		AUTO_INSTALL=y DNS=11 CLIENT=test ENDPOINT="$PUBLIC_IP" \
-			bash scripts/openvpn-install.sh </dev/tty || true
-	fi
-	[[ -e /etc/openvpn/server.conf ]] || die "OpenVPN не установился, смотрите ошибки выше."
-	ok "OpenVPN установлен"
-fi
-
 # ---------- 4. настройки ----------
-step "4/5  Настройки бота"
+step "3/4  Настройки бота"
 tg() { curl -s --max-time 30 "https://api.telegram.org/bot$TOKEN/$1"; }
 json() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)" 2>/dev/null || true; }
 
@@ -139,10 +121,9 @@ BOT_TOKEN=$TOKEN
 # Администраторы (Telegram ID через запятую)
 ADMIN_IDS=$ADMIN
 SUPPORT_CONTACT=$SUPPORT
-OPENVPN_DIR=/etc/openvpn
-EASYRSA_DIR=/etc/openvpn/easy-rsa
 # Следить за сменой IP и рассылать клиентам новые ключи
 IP_AUTO_UPDATE=true
+# (сам IP бот отслеживает на сервере, где стоит; для остальных — кнопка «Изменить IP»)
 IP_CHECK_INTERVAL=60
 IP_CONFIRM_CHECKS=2
 # За сколько дней предупреждать клиента об окончании ключа
@@ -153,7 +134,7 @@ EOF
 fi
 
 # ---------- 5. запуск ----------
-step "5/5  Запускаю бота"
+step "4/4  Запускаю бота"
 cat >/etc/systemd/system/$SERVICE.service <<UNIT
 [Unit]
 Description=OpenVPN Seller Telegram Bot
@@ -183,7 +164,7 @@ if systemctl is-active -q "$SERVICE"; then
 	echo -e "╚══════════════════════════════════════════════╝\e[0m"
 	echo
 	echo -e "  Откройте бота: \e[1mhttps://t.me/$BOT\e[0m  → нажмите /start"
-	echo "  Там кнопки: «➕ Новый ключ», «📋 Ключи», «❓ Как это работает»"
+	echo "  Дальше всё в боте: «🖥 Серверы» → «➕ Добавить сервер» → IP и пароль root"
 	echo
 	echo -e "  Управление на сервере: \e[1mvpnbot\e[0m  (статус, логи, обновление, настройки)"
 	echo

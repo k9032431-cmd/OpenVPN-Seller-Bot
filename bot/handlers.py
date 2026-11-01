@@ -1,38 +1,57 @@
 """Обработчики Telegram.
 
-Админ управляет всем кнопками (команды /new, /list и т.д. тоже работают).
-Клиент получает ключ по ссылке-приглашению и пользуется своим меню.
+Админ: всё кнопками — серверы (добавить, установить OpenVPN, сменить IP, перенести
+клиентов), ключи (создать, продлить, отключить), рассылка.
+Клиент: получает ключ по ссылке-приглашению и пользуется своим меню.
 """
 from __future__ import annotations
 
 import asyncio
 import html
 import math
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup)
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+                           KeyboardButton, Message, ReplyKeyboardMarkup)
 
 from . import services, texts
 from .config import Config
 from .db import DB
-from .ip_detect import detect_public_ip
-from .openvpn import NAME_RE, OpenVPN, OpenVPNError, is_ip, is_valid_host
+from .fleet import Fleet
+from .openvpn import NAME_RE, OpenVPN, is_valid_host
+from .remote import LocalExecutor, RemoteError, bootstrap_ssh
 
 esc = html.escape
 PAGE_SIZE = 8
+ERRORS = services.ERRORS
+SSH_TARGET_RE = re.compile(r"^(?:(?P<user>[a-z_][a-z0-9_-]*)@)?(?P<host>[^\s:@]+)(?::(?P<port>\d{1,5}))?$")
+_background: set[asyncio.Task] = set()
+
+
+def background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
 
 
 class NewKey(StatesGroup):
+    server = State()
     name = State()
     days = State()
 
 
-class SetHost(StatesGroup):
+class AddServer(StatesGroup):
+    name = State()
+    host = State()
+    password = State()
+
+
+class ChangeIP(StatesGroup):
     host = State()
 
 
@@ -51,128 +70,150 @@ def user_keyboard() -> ReplyKeyboardMarkup:
 def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
         [KeyboardButton(text=texts.BTN_NEW), KeyboardButton(text=texts.BTN_KEYS)],
-        [KeyboardButton(text=texts.BTN_IP), KeyboardButton(text=texts.BTN_BCAST)],
+        [KeyboardButton(text=texts.BTN_SERVERS), KeyboardButton(text=texts.BTN_BCAST)],
         [KeyboardButton(text=texts.BTN_HELP)],
     ])
 
 
 def ikb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows
+        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows if row
     ])
 
 
 CANCEL = [("❌ Отмена", "cancel")]
 
 
-def days_keyboard() -> InlineKeyboardMarkup:
-    return ikb([("7 дней", "nd:7"), ("30 дней", "nd:30")],
-               [("90 дней", "nd:90"), ("♾ Бессрочно", "nd:0")], CANCEL)
+async def edit(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup | None = None) -> None:
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    except TelegramBadRequest:  # «message is not modified» или старое сообщение
+        pass
 
 
-def keys_keyboard(rows, page: int) -> InlineKeyboardMarkup:
-    pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
-    page = min(max(page, 0), pages - 1)
-    buttons = []
-    for c in rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
-        icon = ("🟢" if c["status"] == "active" else "🔴") + ("👤" if c["tg_id"] else "🔗")
-        until = "♾" if not c["expires_at"] else services.fmt_date(c["expires_at"])[:10]
-        buttons.append([(f"{icon} {c['name']} · {until}", f"k:{c['name']}")])
-    if pages > 1:
-        buttons.append([("◀️", f"kp:{page - 1}"), (f"{page + 1}/{pages}", "noop"),
-                        ("▶️", f"kp:{page + 1}")])
-    buttons.append([(texts.BTN_NEW, "new")])
-    return ikb(*buttons)
-
-
-def key_card_keyboard(c) -> InlineKeyboardMarkup:
-    n = c["name"]
-    if c["status"] != "active":
-        return ikb([("⬅️ К списку", "kp:0")])
-    return ikb(
-        [("📄 Файл .ovpn", f"kf:{n}"), ("🔗 Новая ссылка", f"kl:{n}")],
-        [("+30 дней", f"ke:{n}:30"), ("+90 дней", f"ke:{n}:90"), ("♾", f"ke:{n}:0")],
-        [("⛔ Отключить", f"kr:{n}")],
-        [("⬅️ К списку", "kp:0")],
-    )
-
-
-# ======================= тексты карточек =======================
 def invite_link(bot_username: str, token: str) -> str:
     return f"https://t.me/{bot_username}?start={token}"
 
 
-def describe(c) -> str:
+# ======================= ключи: тексты =======================
+def server_name(db: DB, sid) -> str:
+    s = db.server(sid) if sid else None
+    return s["name"] if s else "?"
+
+
+def key_card(db: DB, c, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
     who = "ещё не открыл ссылку"
     if c["tg_id"]:
-        who = f"<code>{c['tg_id']}</code>"
-        if c["tg_username"]:
-            who += f" @{esc(c['tg_username'])}"
-    status = "🟢 активен" if c["status"] == "active" else "🔴 отключён"
+        who = f"<code>{c['tg_id']}</code>" + (f" @{esc(c['tg_username'])}" if c["tg_username"] else "")
     lines = [
-        f"🔑 <b>{c['name']}</b> — {status}",
+        f"🔑 <b>{c['name']}</b> — {'🟢 активен' if c['status'] == 'active' else '🔴 отключён'}",
+        f"Сервер: {esc(server_name(db, c['server_id']))}",
         f"Клиент: {who}",
         f"Срок: {services.fmt_until(c['expires_at'])}",
         f"Создан: {services.fmt_date(c['created_at'])}",
     ]
     if c["note"]:
         lines.append(f"Заметка: {esc(c['note'])}")
-    return "\n".join(lines)
-
-
-def key_card_text(c, bot_username: str) -> str:
-    text = describe(c)
     if c["status"] == "active" and not c["tg_id"]:
-        text += f"\n\n🔗 Ссылка для клиента:\n{invite_link(bot_username, c['invite_token'])}"
-    return text
+        lines.append(f"\n🔗 Ссылка для клиента:\n{invite_link(bot_username, c['invite_token'])}")
+    i = c["id"]
+    if c["status"] != "active":
+        kb = ikb([("⬅️ К списку", "kp:0")])
+    else:
+        kb = ikb([("📄 Файл .ovpn", f"kf:{i}"), ("🔗 Новая ссылка", f"kl:{i}")],
+                 [("+30 дней", f"ke:{i}:30"), ("+90 дней", f"ke:{i}:90"), ("♾", f"ke:{i}:0")],
+                 [("⛔ Отключить", f"kr:{i}")],
+                 [("⬅️ К списку", "kp:0")])
+    return "\n".join(lines), kb
 
 
-def keys_header(rows) -> str:
+def keys_list(db: DB, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows = db.list_all()
+    servers = db.servers()
+    names = {s["id"]: s["name"][:10] for s in servers}
+    pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    buttons = []
+    for c in rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
+        icon = ("🟢" if c["status"] == "active" else "🔴") + ("👤" if c["tg_id"] else "🔗")
+        until = "♾" if not c["expires_at"] else services.fmt_date(c["expires_at"])[:10]
+        where = f" · {names.get(c['server_id'], '?')}" if len(servers) > 1 else ""
+        buttons.append([(f"{icon} {c['name']}{where} · {until}", f"k:{c['id']}")])
+    if pages > 1:
+        buttons.append([("◀️", f"kp:{page - 1}"), (f"{page + 1}/{pages}", "noop"), ("▶️", f"kp:{page + 1}")])
+    buttons.append([(texts.BTN_NEW, "new")])
     active = sum(1 for c in rows if c["status"] == "active")
-    return (f"📋 <b>Ключи: {len(rows)}, активных: {active}</b>\n"
+    text = (f"📋 <b>Ключи: {len(rows)}, активных: {active}</b>\n"
             "Нажмите на ключ, чтобы управлять им.\n"
             "🟢 активен · 🔴 отключён · 👤 у клиента · 🔗 ссылку не открыли")
+    if not rows:
+        text = "Ключей пока нет. Нажмите «➕ Новый ключ»."
+    return text, ikb(*buttons)
 
 
-async def ip_text(ovpn: OpenVPN, cfg: Config) -> str:
-    host, port = ovpn.get_remote()
-    version = 6 if ":" in host else 4
-    real = await detect_public_ip(version) or "не удалось определить"
-    if not is_ip(host):
-        auto = "не нужно — в ключах домен"
-    elif cfg.ip_auto_update:
-        auto = f"✅ включено (проверка каждые {cfg.ip_check_interval} c)"
+# ======================= серверы: тексты =======================
+def servers_list(db: DB) -> tuple[str, InlineKeyboardMarkup]:
+    servers = db.servers()
+    rows = [[(f"🖥 {s['name']} · {s['host']} · 🔑{db.count_active(s['id'])}", f"s:{s['id']}")]
+            for s in servers]
+    rows.append([("➕ Добавить сервер", "sa")])
+    if servers:
+        text = "🖥 <b>Ваши серверы</b>\nНажмите на сервер, чтобы управлять им."
     else:
-        auto = "выключено"
-    return (f"🌐 <b>Адрес сервера</b>\n\n"
-            f"В ключах клиентов: <code>{host}:{port}</code>\n"
-            f"Реальный IP сейчас: <code>{real}</code>\n"
-            f"Автообновление: {auto}\n\n"
-            "Если IP поменяется, бот сам разошлёт клиентам новые ключи.")
+        text = ("🖥 <b>Серверов пока нет</b>\n\n"
+                "Нажмите «➕ Добавить сервер». Понадобится только IP и пароль root —\n"
+                "бот сам подключится и установит OpenVPN.")
+    return text, ikb(*rows)
 
 
-async def create_key(m: Message, db: DB, ovpn: OpenVPN, bot_username: str,
-                     name: str, days: int, note: str | None) -> None:
+async def server_card(db: DB, fleet: Fleet, sid: int) -> tuple[str, InlineKeyboardMarkup]:
+    s = db.server(sid)
+    if s is None:
+        return "Сервер не найден.", ikb([("⬅️ К серверам", "sl")])
+    o = fleet.ovpn(s)
+    reachable = installed = running = False
+    remote = None
+    error = ""
     try:
-        await ovpn.create_client(name)
-    except OpenVPNError as e:
-        await m.answer(f"❌ {esc(str(e))}", reply_markup=admin_keyboard())
-        return
-    token = db.add_client(name, days, note)
-    c = db.get(name)
-    await m.answer(
-        f"✅ Ключ <b>{name}</b> создан · {services.fmt_until(c['expires_at'])}\n\n"
-        f"👉 <b>Перешлите клиенту эту ссылку:</b>\n{invite_link(bot_username, token)}\n\n"
-        "Клиент откроет её, нажмёт «Запустить» — и получит ключ.\n"
-        "Файл ниже — на случай, если хотите отправить его сами.",
-        reply_markup=admin_keyboard(),
-    )
-    await m.answer_document(BufferedInputFile(ovpn.build_ovpn(name), f"{name}.ovpn"))
+        installed = await o.is_installed()
+        reachable = True
+        if installed:
+            running = await o.is_running()
+            remote = await o.get_remote()
+    except ERRORS as e:
+        error = str(e)
+    busy = sid in fleet.busy
+    count = db.count_active(sid)
 
+    lines = [f"🖥 <b>{esc(s['name'])}</b>"]
+    lines.append("📍 Бот стоит на этом же сервере" if s["kind"] == "local"
+                 else f"SSH: <code>{s['user']}@{s['host']}:{s['port']}</code>")
+    if busy:
+        lines.append("⏳ Сейчас идёт установка или перенос…")
+    elif not reachable:
+        lines.append(f"⚠️ Нет связи: {esc(error)}")
+    elif not installed:
+        lines.append("❌ OpenVPN не установлен — нажмите «⚙️ Установить OpenVPN»")
+    else:
+        lines.append("✅ OpenVPN работает" if running else "⚠️ OpenVPN установлен, но не запущен")
+    if remote:
+        lines.append(f"Адрес в ключах: <code>{remote[0]}:{remote[1]}</code> ({remote[2].upper()})")
+    lines.append(f"Активных ключей: {count}")
 
-def parse_name(text: str) -> tuple[str, str | None]:
-    parts = text.strip().split(maxsplit=1)
-    return parts[0], (parts[1] if len(parts) > 1 else None)
+    others = [x for x in db.servers() if x["id"] != sid]
+    rows = []
+    if not busy:
+        if reachable and not installed:
+            rows.append([("⚙️ Установить OpenVPN", f"si:{sid}")])
+        if installed:
+            rows.append([("🔄 Разослать ключи", f"sp:{sid}"), ("🔃 Перезапустить VPN", f"sr:{sid}")])
+        if installed or not reachable:
+            rows.append([("✏️ Изменить IP", f"sc:{sid}")])
+        if count and others:
+            rows.append([("🔁 Перенести клиентов на другой сервер", f"st:{sid}")])
+    rows.append([("♻️ Обновить", f"s:{sid}"), ("🗑 Удалить", f"sd:{sid}")])
+    rows.append([("⬅️ К серверам", "sl")])
+    return "\n".join(lines), ikb(*rows)
 
 
 # ======================= АДМИН =======================
@@ -188,32 +229,18 @@ def build_admin_router(cfg: Config) -> Router:
     async def menu_help(m: Message, state: FSMContext):
         await state.clear()
         await m.answer(texts.HOW_IT_WORKS.format(warn=cfg.warn_days), reply_markup=admin_keyboard())
-        await m.answer(texts.ADMIN_HELP)
-
-    @r.message(F.text == texts.BTN_NEW)
-    async def menu_new(m: Message, state: FSMContext):
-        await state.set_state(NewKey.name)
-        await m.answer("✏️ Напишите <b>имя ключа</b> латиницей, например <code>ahmet</code>\n"
-                       "Можно добавить заметку через пробел: <code>ahmet Ахмет +99361234567</code>",
-                       reply_markup=ikb(CANCEL))
 
     @r.message(F.text == texts.BTN_KEYS)
-    @r.message(Command("list"))
-    async def menu_keys(m: Message, state: FSMContext, db: DB, ovpn: OpenVPN):
+    async def menu_keys(m: Message, state: FSMContext, db: DB):
         await state.clear()
-        services.sync_from_easyrsa(db, ovpn)
-        rows = db.list_all()
-        if not rows:
-            return await m.answer("Ключей пока нет. Нажмите «➕ Новый ключ».",
-                                  reply_markup=admin_keyboard())
-        await m.answer(keys_header(rows), reply_markup=keys_keyboard(rows, 0))
+        text, kb = keys_list(db, 0)
+        await m.answer(text, reply_markup=kb)
 
-    @r.message(F.text == texts.BTN_IP)
-    @r.message(Command("ip"))
-    async def menu_ip(m: Message, state: FSMContext, ovpn: OpenVPN):
+    @r.message(F.text == texts.BTN_SERVERS)
+    async def menu_servers(m: Message, state: FSMContext, db: DB):
         await state.clear()
-        await m.answer(await ip_text(ovpn, cfg), reply_markup=ikb(
-            [("🔄 Разослать ключи всем", "push")], [("✏️ Сменить адрес вручную", "sethost")]))
+        text, kb = servers_list(db)
+        await m.answer(text, reply_markup=kb)
 
     @r.message(F.text == texts.BTN_BCAST)
     async def menu_bcast(m: Message, state: FSMContext):
@@ -223,240 +250,385 @@ def build_admin_router(cfg: Config) -> Router:
     @r.callback_query(F.data == "cancel")
     async def cb_cancel(cb: CallbackQuery, state: FSMContext):
         await state.clear()
-        await cb.message.edit_text("Отменено.")
         await cb.answer()
+        await edit(cb, "Отменено.")
 
     @r.callback_query(F.data == "noop")
     async def cb_noop(cb: CallbackQuery):
         await cb.answer()
 
-    # ---------- новый ключ ----------
-    @r.callback_query(F.data == "new")
-    async def cb_new(cb: CallbackQuery, state: FSMContext):
+    # ================= СЕРВЕРЫ =================
+    @r.callback_query(F.data == "sl")
+    async def cb_servers(cb: CallbackQuery, db: DB):
         await cb.answer()
-        await menu_new(cb.message, state)
+        await edit(cb, *servers_list(db))
+
+    @r.callback_query(F.data.regexp(r"^s:\d+$"))
+    async def cb_server(cb: CallbackQuery, db: DB, fleet: Fleet):
+        await cb.answer("Проверяю сервер…")
+        await edit(cb, *await server_card(db, fleet, int(cb.data[2:])))
+
+    # ---------- добавить сервер ----------
+    @r.callback_query(F.data == "sa")
+    async def cb_add(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        await state.set_state(AddServer.name)
+        await cb.message.answer("🖥 <b>Новый сервер</b>\n\nШаг 1 из 3. Как назвать сервер?\n"
+                                "Например: <code>Германия-1</code>", reply_markup=ikb(CANCEL))
+
+    @r.message(AddServer.name, F.text)
+    async def add_name(m: Message, state: FSMContext, db: DB):
+        await state.update_data(name=m.text.strip()[:40])
+        await state.set_state(AddServer.host)
+        rows = [CANCEL]
+        if db.local_server() is None:
+            rows.insert(0, [("📍 Этот сервер (где стоит бот)", "sa_local")])
+        await m.answer("Шаг 2 из 3. Напишите <b>IP сервера</b>, например <code>1.2.3.4</code>\n"
+                       "Если SSH-порт не 22: <code>1.2.3.4:2222</code>", reply_markup=ikb(*rows))
+
+    @r.message(AddServer.host, F.text)
+    async def add_host(m: Message, state: FSMContext):
+        match = SSH_TARGET_RE.match(m.text.strip())
+        if not match or not is_valid_host(match["host"]) or int(match["port"] or 22) > 65535:
+            return await m.answer("❗ Не похоже на IP. Пример: <code>1.2.3.4</code>", reply_markup=ikb(CANCEL))
+        user = match["user"] or "root"
+        await state.update_data(host=match["host"], port=int(match["port"] or 22), user=user)
+        await state.set_state(AddServer.password)
+        await m.answer(f"Шаг 3 из 3. Напишите <b>пароль {user}</b> от сервера.\n\n"
+                       "🔒 Бот зайдёт один раз, добавит свой ключ и удалит ваше сообщение с паролем. "
+                       "Пароль нигде не сохраняется.", reply_markup=ikb(CANCEL))
+
+    @r.message(AddServer.password, F.text)
+    async def add_password(m: Message, state: FSMContext, db: DB, fleet: Fleet):
+        password = m.text
+        try:
+            await m.delete()
+        except TelegramBadRequest:
+            pass
+        data = await state.get_data()
+        status = await m.answer(f"⏳ Подключаюсь к {data['host']}…")
+        try:
+            host_key = await bootstrap_ssh(data["host"], data["port"], data["user"], password, fleet.pubkey)
+        except RemoteError as e:
+            return await status.edit_text(f"❌ {esc(str(e))}\n\nНапишите пароль ещё раз:",
+                                          reply_markup=ikb(CANCEL))
+        await state.clear()
+        sid = db.add_server(data["name"], "ssh", data["host"], data["port"], data["user"], host_key)
+        await after_add(status, db, fleet, sid)
+
+    @r.callback_query(AddServer.host, F.data == "sa_local")
+    async def add_local(cb: CallbackQuery, state: FSMContext, db: DB, fleet: Fleet):
+        await cb.answer()
+        data = await state.get_data()
+        await state.clear()
+        ip = await OpenVPN(LocalExecutor()).public_ip() or "localhost"
+        sid = db.add_server(data["name"], "local", ip)
+        await after_add(cb.message, db, fleet, sid)
+
+    async def after_add(msg: Message, db: DB, fleet: Fleet, sid: int):
+        try:
+            added, _ = await services.sync(db, fleet, sid)
+            found = f"\nНайдено готовых ключей на сервере: {len(added)}" if added else ""
+        except ERRORS:
+            found = ""
+        text, kb = await server_card(db, fleet, sid)
+        await msg.answer(f"✅ Сервер добавлен!{found}\n\n{text}", reply_markup=kb)
+
+    # ---------- установка OpenVPN ----------
+    @r.callback_query(F.data.regexp(r"^si:\d+$"))
+    async def cb_install_ask(cb: CallbackQuery):
+        sid = cb.data[3:]
+        await cb.answer()
+        await edit(cb, "⚙️ <b>Установка OpenVPN</b>\n\nВыберите вариант (если не знаете — первый):",
+                   ikb([("UDP 1194 — рекомендуется", f"sI:{sid}:udp:1194")],
+                       [("TCP 443 — если UDP блокируют", f"sI:{sid}:tcp:443")],
+                       [("⬅️ Назад", f"s:{sid}")]))
+
+    @r.callback_query(F.data.startswith("sI:"))
+    async def cb_install(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
+        _, sid, proto, port = cb.data.split(":")
+        sid = int(sid)
+        if sid in fleet.busy:
+            return await cb.answer("Уже идёт установка", show_alert=True)
+        await cb.answer()
+        name = esc(server_name(db, sid))
+        await edit(cb, f"⏳ Устанавливаю OpenVPN на <b>{name}</b>…\n"
+                       "Обычно это 2–5 минут. Я напишу, когда закончу.")
+
+        async def job():
+            fleet.busy.add(sid)
+            try:
+                await services.install_openvpn(db, fleet, sid, proto, int(port))
+                fleet.busy.discard(sid)
+                text, kb = await server_card(db, fleet, sid)
+                await bot.send_message(cb.from_user.id,
+                                       f"🎉 OpenVPN установлен на <b>{name}</b>!\n"
+                                       f"Теперь можно создавать ключи: «➕ Новый ключ».\n\n{text}",
+                                       reply_markup=kb)
+            except Exception as e:
+                await bot.send_message(cb.from_user.id, f"❌ Установка на <b>{name}</b> не удалась:\n"
+                                                        f"<pre>{esc(str(e))[-1500:]}</pre>")
+            finally:
+                fleet.busy.discard(sid)
+        background(job())
+
+    # ---------- рассылка ключей / перезапуск ----------
+    @r.callback_query(F.data.startswith("sp:"))
+    async def cb_push(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
+        await cb.answer("Рассылаю…")
+        ok, fail = await services.push_configs(bot, db, fleet, int(cb.data[3:]), texts.PUSH_CAPTION)
+        await cb.message.answer(f"✅ Ключи разосланы: {ok}, не доставлено: {fail}.")
+
+    @r.callback_query(F.data.startswith("sr:"))
+    async def cb_restart(cb: CallbackQuery, db: DB, fleet: Fleet):
+        try:
+            await fleet.by_id(int(cb.data[3:])).restart()
+            await cb.answer("OpenVPN перезапущен")
+        except ERRORS as e:
+            await cb.answer(str(e)[:190], show_alert=True)
+        await edit(cb, *await server_card(db, fleet, int(cb.data[3:])))
+
+    # ---------- смена IP ----------
+    @r.callback_query(F.data.startswith("sc:"))
+    async def cb_change_ip(cb: CallbackQuery, state: FSMContext, db: DB):
+        sid = int(cb.data[3:])
+        await cb.answer()
+        await state.set_state(ChangeIP.host)
+        await state.update_data(sid=sid)
+        await cb.message.answer(
+            f"✏️ Напишите <b>новый IP</b> сервера «{esc(server_name(db, sid))}» (или домен).\n\n"
+            "Бот подключится по новому адресу, обновит ключи и сам разошлёт их всем клиентам "
+            "этого сервера.", reply_markup=ikb(CANCEL))
+
+    @r.message(ChangeIP.host, F.text)
+    async def change_ip_text(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot):
+        host = m.text.strip()
+        if not is_valid_host(host):
+            return await m.answer("❗ Это не похоже на IP или домен. Пример: <code>1.2.3.4</code>",
+                                  reply_markup=ikb(CANCEL))
+        sid = (await state.get_data())["sid"]
+        await state.clear()
+        status = await m.answer(f"⏳ Подключаюсь к {host}…")
+        try:
+            await services.change_address(bot, db, fleet, cfg, sid, host, "вручную", move_ssh=True)
+        except ERRORS as e:
+            return await status.edit_text(
+                f"❌ {esc(str(e))}\n\nАдрес не изменён. Проверьте IP и попробуйте ещё раз.\n"
+                "Если это <b>другой</b> сервер (новый) — добавьте его через «➕ Добавить сервер» "
+                "и перенесите клиентов.")
+        await status.edit_text("✅ Готово.")
+
+    # ---------- перенос клиентов ----------
+    @r.callback_query(F.data.startswith("st:"))
+    async def cb_transfer_pick(cb: CallbackQuery, db: DB):
+        src = int(cb.data[3:])
+        others = [s for s in db.servers() if s["id"] != src]
+        await cb.answer()
+        await edit(cb, f"🔁 Куда перенести клиентов с «{esc(server_name(db, src))}»?\n"
+                       "Каждый клиент получит новый ключ от выбранного сервера, сроки сохранятся.",
+                   ikb(*[[(f"🖥 {s['name']}", f"sT:{src}:{s['id']}")] for s in others],
+                       [("⬅️ Назад", f"s:{src}")]))
+
+    @r.callback_query(F.data.startswith("sT:"))
+    async def cb_transfer_confirm(cb: CallbackQuery, db: DB):
+        _, src, dst = cb.data.split(":")
+        await cb.answer()
+        await edit(cb, f"Перенести {db.count_active(int(src))} клиентов\n"
+                       f"«{esc(server_name(db, int(src)))}» → «{esc(server_name(db, int(dst)))}»?",
+                   ikb([("✅ Да, перенести", f"sY:{src}:{dst}"), ("Нет", f"s:{src}")]))
+
+    @r.callback_query(F.data.startswith("sY:"))
+    async def cb_transfer(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
+        _, src, dst = cb.data.split(":")
+        src, dst = int(src), int(dst)
+        if {src, dst} & fleet.busy:
+            return await cb.answer("Сервер сейчас занят", show_alert=True)
+        await cb.answer()
+        await edit(cb, "⏳ Переношу клиентов… Я напишу, когда закончу.")
+
+        async def job():
+            fleet.busy.update({src, dst})
+            try:
+                ok, fail = await services.transfer_clients(bot, db, fleet, src, dst)
+                await bot.send_message(cb.from_user.id, f"🔁 Перенесено клиентов: {ok}, ошибок: {fail}.\n"
+                                                        "Все перенесённые клиенты получили новые ключи.")
+            except Exception as e:
+                await bot.send_message(cb.from_user.id, f"❌ Перенос не удался: {esc(str(e))}")
+            finally:
+                fleet.busy.difference_update({src, dst})
+        background(job())
+
+    # ---------- удаление ----------
+    @r.callback_query(F.data.startswith("sd:"))
+    async def cb_delete_ask(cb: CallbackQuery, db: DB):
+        sid = int(cb.data[3:])
+        await cb.answer()
+        n = db.count_active(sid)
+        warn = f"\n{n} активных ключей будут отключены в боте, клиенты получат уведомление." if n else ""
+        await edit(cb, f"🗑 Удалить сервер «{esc(server_name(db, sid))}» из бота?{warn}\n"
+                       "На самом сервере ничего не удаляется.",
+                   ikb([("Да, удалить", f"sD:{sid}"), ("Нет", f"s:{sid}")]))
+
+    @r.callback_query(F.data.startswith("sD:"))
+    async def cb_delete(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
+        await services.delete_server(bot, db, fleet, int(cb.data[3:]))
+        await cb.answer("Сервер удалён")
+        await edit(cb, *servers_list(db))
+
+    # ================= КЛЮЧИ =================
+    @r.message(F.text == texts.BTN_NEW)
+    async def menu_new(m: Message, state: FSMContext, db: DB):
+        await state.clear()
+        servers = db.servers()
+        if not servers:
+            return await m.answer("Сначала добавьте сервер: «🖥 Серверы» → «➕ Добавить сервер».",
+                                  reply_markup=admin_keyboard())
+        if len(servers) == 1:
+            await state.update_data(sid=servers[0]["id"])
+            return await ask_name(m, state)
+        await state.set_state(NewKey.server)
+        await m.answer("🖥 На каком сервере создать ключ?",
+                       reply_markup=ikb(*[[(f"🖥 {s['name']}", f"ns:{s['id']}")] for s in servers], CANCEL))
+
+    async def ask_name(m: Message, state: FSMContext):
+        await state.set_state(NewKey.name)
+        await m.answer("✏️ Напишите <b>имя ключа</b> латиницей, например <code>ahmet</code>\n"
+                       "Можно добавить заметку через пробел: <code>ahmet Ахмет +99361234567</code>",
+                       reply_markup=ikb(CANCEL))
+
+    @r.callback_query(F.data == "new")
+    async def cb_new(cb: CallbackQuery, state: FSMContext, db: DB):
+        await cb.answer()
+        await menu_new(cb.message, state, db)
+
+    @r.callback_query(NewKey.server, F.data.startswith("ns:"))
+    async def new_server(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        await state.update_data(sid=int(cb.data[3:]))
+        await edit(cb, "🖥 Сервер выбран.")
+        await ask_name(cb.message, state)
 
     @r.message(NewKey.name, F.text)
     async def new_name(m: Message, state: FSMContext, db: DB):
-        name, note = parse_name(m.text)
+        parts = m.text.strip().split(maxsplit=1)
+        name, note = parts[0], (parts[1] if len(parts) > 1 else None)
         if not NAME_RE.match(name):
             return await m.answer("❗ Только латинские буквы, цифры, «_» и «-», без пробелов "
                                   "(до 32 символов). Попробуйте ещё раз:", reply_markup=ikb(CANCEL))
-        old = db.get(name)
+        sid = (await state.get_data())["sid"]
+        old = db.get_by_name(sid, name)
         if old and old["status"] == "active":
             return await m.answer(f"❗ Ключ <b>{name}</b> уже есть. Придумайте другое имя:",
                                   reply_markup=ikb(CANCEL))
         await state.update_data(name=name, note=note)
         await state.set_state(NewKey.days)
-        await m.answer(f"⏳ На какой срок ключ <b>{name}</b>?\n"
-                       "Нажмите кнопку или напишите число дней.", reply_markup=days_keyboard())
+        await m.answer(f"⏳ На какой срок ключ <b>{name}</b>?\nНажмите кнопку или напишите число дней.",
+                       reply_markup=ikb([("7 дней", "nd:7"), ("30 дней", "nd:30")],
+                                        [("90 дней", "nd:90"), ("♾ Бессрочно", "nd:0")], CANCEL))
 
-    async def finish_new(m: Message, state: FSMContext, days: int, db, ovpn, bot_username):
+    async def create_key(m: Message, state: FSMContext, days: int, db: DB, fleet: Fleet, bot_username: str):
         data = await state.get_data()
         await state.clear()
-        await create_key(m, db, ovpn, bot_username, data["name"], days, data.get("note"))
+        sid, name = data["sid"], data["name"]
+        status = await m.answer(f"⏳ Создаю ключ {name}…")
+        try:
+            await fleet.by_id(sid).create_client(name)
+            cid = db.add_client(sid, name, days, data.get("note"))
+            c = db.get(cid)
+            doc = await services.config_file(fleet, c)
+        except (*ERRORS, KeyError) as e:
+            return await status.edit_text(f"❌ Не удалось создать ключ: {esc(str(e))}")
+        await status.edit_text(
+            f"✅ Ключ <b>{name}</b> создан · {services.fmt_until(c['expires_at'])}\n\n"
+            f"👉 <b>Перешлите клиенту эту ссылку:</b>\n{invite_link(bot_username, c['invite_token'])}\n\n"
+            "Клиент откроет её, нажмёт «Запустить» — и получит ключ.\n"
+            "Файл ниже — если хотите отправить его сами.", disable_web_page_preview=True)
+        await m.answer_document(doc, reply_markup=admin_keyboard())
 
     @r.callback_query(NewKey.days, F.data.startswith("nd:"))
-    async def new_days_cb(cb: CallbackQuery, state: FSMContext, db: DB, ovpn: OpenVPN, bot_username: str):
+    async def new_days_cb(cb: CallbackQuery, state: FSMContext, db: DB, fleet: Fleet, bot_username: str):
         await cb.answer()
-        await cb.message.edit_reply_markup(reply_markup=None)
-        await finish_new(cb.message, state, int(cb.data[3:]), db, ovpn, bot_username)
+        await edit(cb, f"Срок: {'бессрочно' if cb.data == 'nd:0' else cb.data[3:] + ' дней'}")
+        await create_key(cb.message, state, int(cb.data[3:]), db, fleet, bot_username)
 
     @r.message(NewKey.days, F.text.regexp(r"^\d{1,4}$"))
-    async def new_days_text(m: Message, state: FSMContext, db: DB, ovpn: OpenVPN, bot_username: str):
-        await finish_new(m, state, int(m.text), db, ovpn, bot_username)
-
-    @r.message(NewKey.days)
-    async def new_days_bad(m: Message):
-        await m.answer("Нажмите кнопку или напишите число дней (0 — бессрочно).",
-                       reply_markup=days_keyboard())
+    async def new_days_text(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot_username: str):
+        await create_key(m, state, int(m.text), db, fleet, bot_username)
 
     # ---------- список и карточка ключа ----------
     @r.callback_query(F.data.startswith("kp:"))
     async def cb_page(cb: CallbackQuery, db: DB):
-        rows = db.list_all()
         await cb.answer()
-        if not rows:
-            return await cb.message.edit_text("Ключей пока нет.")
-        await cb.message.edit_text(keys_header(rows), reply_markup=keys_keyboard(rows, int(cb.data[3:])))
+        await edit(cb, *keys_list(db, int(cb.data[3:])))
 
-    async def show_card(cb: CallbackQuery, db: DB, name: str, bot_username: str):
-        c = db.get(name)
+    async def show_key(cb: CallbackQuery, db: DB, cid: int, bot_username: str):
+        c = db.get(cid)
         if not c:
-            return await cb.answer("Ключ не найден", show_alert=True)
-        try:
-            await cb.message.edit_text(key_card_text(c, bot_username), reply_markup=key_card_keyboard(c),
-                                       disable_web_page_preview=True)
-        except TelegramBadRequest:  # «message is not modified» — ничего не поменялось
-            pass
+            return await edit(cb, "Ключ не найден.", ikb([("⬅️ К списку", "kp:0")]))
+        await edit(cb, *key_card(db, c, bot_username))
 
     @r.callback_query(F.data.startswith("k:"))
-    async def cb_card(cb: CallbackQuery, db: DB, bot_username: str):
+    async def cb_key(cb: CallbackQuery, db: DB, bot_username: str):
         await cb.answer()
-        await show_card(cb, db, cb.data[2:], bot_username)
+        await show_key(cb, db, int(cb.data[2:]), bot_username)
 
     @r.callback_query(F.data.startswith("kf:"))
-    async def cb_file(cb: CallbackQuery, ovpn: OpenVPN):
-        name = cb.data[3:]
+    async def cb_file(cb: CallbackQuery, db: DB, fleet: Fleet):
         try:
-            await cb.message.answer_document(BufferedInputFile(ovpn.build_ovpn(name), f"{name}.ovpn"))
+            doc = await services.config_file(fleet, db.get(int(cb.data[3:])))
             await cb.answer()
-        except OpenVPNError as e:
-            await cb.answer(str(e), show_alert=True)
+            await cb.message.answer_document(doc)
+        except (*ERRORS, KeyError) as e:
+            await cb.answer(str(e)[:190], show_alert=True)
 
     @r.callback_query(F.data.startswith("kl:"))
     async def cb_link(cb: CallbackQuery, db: DB, bot_username: str):
-        db.reset_invite(cb.data[3:])
+        db.reset_invite(int(cb.data[3:]))
         await cb.answer("Новая ссылка готова. Старая больше не работает.", show_alert=True)
-        await show_card(cb, db, cb.data[3:], bot_username)
+        await show_key(cb, db, int(cb.data[3:]), bot_username)
 
     @r.callback_query(F.data.startswith("ke:"))
     async def cb_extend(cb: CallbackQuery, db: DB, bot: Bot, bot_username: str):
-        name, days = cb.data[3:].rsplit(":", 1)
-        c = db.get(name)
+        cid, days = map(int, cb.data[3:].split(":"))
+        c = db.get(cid)
         if not c or c["status"] != "active":
             return await cb.answer("Ключ не активен", show_alert=True)
-        until = services.fmt_until(db.extend(name, int(days)))
+        until = services.fmt_until(db.extend(cid, days))
         await cb.answer(f"Продлено: {until}")
         if c["tg_id"]:
-            await services.safe_send(bot, c["tg_id"], texts.EXTENDED_USER.format(name=name, until=until))
-        await show_card(cb, db, name, bot_username)
+            await services.safe_send(bot, c["tg_id"], texts.EXTENDED_USER.format(name=c["name"], until=until))
+        await show_key(cb, db, cid, bot_username)
 
     @r.callback_query(F.data.startswith("kr:"))
-    async def cb_revoke_ask(cb: CallbackQuery):
-        name = cb.data[3:]
+    async def cb_revoke_ask(cb: CallbackQuery, db: DB):
+        c = db.get(int(cb.data[3:]))
         await cb.answer()
-        await cb.message.edit_text(
-            f"⛔ Отключить ключ <b>{name}</b>?\nКлиент больше не сможет подключиться. Отменить нельзя.",
-            reply_markup=ikb([("Да, отключить", f"krY:{name}"), ("Нет", f"k:{name}")]))
+        await edit(cb, f"⛔ Отключить ключ <b>{c['name']}</b>?\n"
+                       "Клиент больше не сможет подключиться. Отменить нельзя.",
+                   ikb([("Да, отключить", f"kR:{c['id']}"), ("Нет", f"k:{c['id']}")]))
 
-    @r.callback_query(F.data.startswith("krY:"))
-    async def cb_revoke(cb: CallbackQuery, db: DB, ovpn: OpenVPN, bot: Bot, bot_username: str):
-        name = cb.data[4:]
+    @r.callback_query(F.data.startswith("kR:"))
+    async def cb_revoke(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot, bot_username: str):
+        cid = int(cb.data[3:])
         try:
-            await services.revoke(bot, db, ovpn, name, texts.REVOKED_USER)
-        except OpenVPNError as e:
+            await services.revoke(bot, db, fleet, cid, texts.REVOKED_USER)
+        except (*ERRORS, KeyError) as e:
             return await cb.answer(str(e)[:190], show_alert=True)
         await cb.answer("Ключ отключён")
-        await show_card(cb, db, name, bot_username)
+        await show_key(cb, db, cid, bot_username)
 
-    # ---------- IP ----------
-    @r.callback_query(F.data == "push")
-    @r.message(Command("push"))
-    async def do_push(event, db: DB, ovpn: OpenVPN, bot: Bot):
-        m = event.message if isinstance(event, CallbackQuery) else event
-        if isinstance(event, CallbackQuery):
-            await event.answer()
-        await m.answer("⏳ Рассылаю ключи…")
-        ok, fail = await services.push_configs(bot, db, ovpn, texts.PUSH_CAPTION)
-        await m.answer(f"✅ Отправлено: {ok}, не доставлено: {fail}.")
-
-    @r.callback_query(F.data == "sethost")
-    async def cb_sethost(cb: CallbackQuery, state: FSMContext):
-        await cb.answer()
-        await state.set_state(SetHost.host)
-        await cb.message.answer("✏️ Напишите новый IP или домен сервера, например <code>1.2.3.4</code>\n"
-                                "Всем клиентам сразу уйдут новые ключи.", reply_markup=ikb(CANCEL))
-
-    async def set_host(m: Message, host: str, db, ovpn, bot):
-        if not is_valid_host(host):
-            return await m.answer("❗ Это не похоже на IP или домен. Пример: <code>1.2.3.4</code>")
-        await m.answer("⏳ Меняю адрес и рассылаю ключи…")
-        await services.apply_new_host(bot, db, ovpn, cfg, host, "вручную")
-
-    @r.message(SetHost.host, F.text)
-    async def sethost_text(m: Message, state: FSMContext, db: DB, ovpn: OpenVPN, bot: Bot):
-        if is_valid_host(m.text.strip()):
-            await state.clear()
-        await set_host(m, m.text.strip(), db, ovpn, bot)
-
-    @r.message(Command("setip"))
-    async def cmd_setip(m: Message, command: CommandObject, db: DB, ovpn: OpenVPN, bot: Bot):
-        await set_host(m, (command.args or "").strip(), db, ovpn, bot)
-
-    # ---------- рассылка ----------
-    async def broadcast(m: Message, text: str, db: DB, bot: Bot):
+    # ================= РАССЫЛКА =================
+    @r.message(Broadcast.text, F.text)
+    async def bcast_text(m: Message, state: FSMContext, db: DB, bot: Bot):
+        await state.clear()
         ok = fail = 0
         for uid in db.user_ids():
-            if await services.safe_send(bot, uid, f"📢 {esc(text)}"):
+            if await services.safe_send(bot, uid, f"📢 {esc(m.text)}"):
                 ok += 1
             else:
                 fail += 1
             await asyncio.sleep(0.05)
         await m.answer(f"📢 Доставлено: {ok}, не доставлено: {fail}.", reply_markup=admin_keyboard())
-
-    @r.message(Broadcast.text, F.text)
-    async def bcast_text(m: Message, state: FSMContext, db: DB, bot: Bot):
-        await state.clear()
-        await broadcast(m, m.text, db, bot)
-
-    @r.message(Command("broadcast"))
-    async def cmd_broadcast(m: Message, command: CommandObject, db: DB, bot: Bot):
-        if not command.args:
-            return await m.answer("Использование: <code>/broadcast текст</code>")
-        await broadcast(m, command.args, db, bot)
-
-    # ---------- команды (для тех, кто любит текстом) ----------
-    @r.message(Command("new"))
-    async def cmd_new(m: Message, command: CommandObject, db: DB, ovpn: OpenVPN, bot_username: str):
-        args = (command.args or "").split(maxsplit=2)
-        if not args or (len(args) > 1 and not args[1].isdigit()):
-            return await m.answer("Использование: <code>/new имя [дней] [заметка]</code>")
-        days = int(args[1]) if len(args) > 1 else 0
-        await create_key(m, db, ovpn, bot_username, args[0], days, args[2] if len(args) > 2 else None)
-
-    @r.message(Command("info"))
-    async def cmd_info(m: Message, command: CommandObject, db: DB, bot_username: str):
-        c = db.get((command.args or "").strip())
-        if not c:
-            return await m.answer("Не найден. Использование: <code>/info имя</code>")
-        await m.answer(key_card_text(c, bot_username), reply_markup=key_card_keyboard(c))
-
-    @r.message(Command("get"))
-    async def cmd_get(m: Message, command: CommandObject, ovpn: OpenVPN):
-        name = (command.args or "").strip()
-        if not ovpn.is_valid_client(name):
-            return await m.answer("Активный ключ не найден. Использование: <code>/get имя</code>")
-        await m.answer_document(BufferedInputFile(ovpn.build_ovpn(name), f"{name}.ovpn"))
-
-    @r.message(Command("link"))
-    async def cmd_link(m: Message, command: CommandObject, db: DB, bot_username: str):
-        name = (command.args or "").strip()
-        c = db.get(name)
-        if not c or c["status"] != "active":
-            return await m.answer("Активный ключ не найден. Использование: <code>/link имя</code>")
-        token = db.reset_invite(name)
-        await m.answer(f"🔗 Новая ссылка для <b>{name}</b>:\n{invite_link(bot_username, token)}")
-
-    @r.message(Command("extend"))
-    async def cmd_extend(m: Message, command: CommandObject, db: DB, bot: Bot):
-        args = (command.args or "").split()
-        if len(args) != 2 or not args[1].isdigit():
-            return await m.answer("Использование: <code>/extend имя дней</code> (0 — бессрочно)")
-        c = db.get(args[0])
-        if not c or c["status"] != "active":
-            return await m.answer("Активный ключ не найден.")
-        until = services.fmt_until(db.extend(args[0], int(args[1])))
-        await m.answer(f"✅ <b>{args[0]}</b>: {until}")
-        if c["tg_id"]:
-            await services.safe_send(bot, c["tg_id"], texts.EXTENDED_USER.format(name=args[0], until=until))
-
-    @r.message(Command("revoke"))
-    async def cmd_revoke(m: Message, command: CommandObject, db: DB, ovpn: OpenVPN, bot: Bot):
-        name = (command.args or "").strip()
-        if not db.get(name) and not ovpn.is_valid_client(name):
-            return await m.answer("Ключ не найден. Использование: <code>/revoke имя</code>")
-        try:
-            await services.revoke(bot, db, ovpn, name, texts.REVOKED_USER)
-        except OpenVPNError as e:
-            return await m.answer(f"❌ {esc(str(e))}")
-        await m.answer(f"🔴 Ключ <b>{esc(name)}</b> отключён.")
-
-    @r.message(Command("sync"))
-    async def cmd_sync(m: Message, db: DB, ovpn: OpenVPN):
-        added, gone = services.sync_from_easyrsa(db, ovpn)
-        await m.answer(f"🔄 Добавлено из easy-rsa: {len(added)} {', '.join(added)}\n"
-                       f"Помечено отключёнными: {len(gone)}")
 
     # любое другое сообщение админа (кроме /start) — показать меню
     @r.message(F.text, ~F.text.startswith("/"))
@@ -472,7 +644,7 @@ def build_user_router() -> Router:
 
     @r.message(CommandStart())
     async def cmd_start(m: Message, command: CommandObject, state: FSMContext,
-                        db: DB, ovpn: OpenVPN, cfg: Config):
+                        db: DB, fleet: Fleet, cfg: Config):
         await state.clear()
         token = (command.args or "").strip()
         if not token:
@@ -481,7 +653,6 @@ def build_user_router() -> Router:
             has = db.clients_of(m.from_user.id)
             return await m.answer(texts.WELCOME_BACK if has else texts.NO_KEYS,
                                   reply_markup=user_keyboard())
-
         c = db.get_by_token(token)
         if not c:
             return await m.answer(texts.INVITE_INVALID)
@@ -489,18 +660,19 @@ def build_user_router() -> Router:
             return await m.answer(texts.INVITE_REVOKED)
         if c["tg_id"] and c["tg_id"] != m.from_user.id:
             return await m.answer(texts.INVITE_TAKEN)
-        db.bind(c["name"], m.from_user.id, m.from_user.username)
+        db.bind(c["id"], m.from_user.id, m.from_user.username)
         await m.answer(texts.WELCOME_BOUND.format(name=c["name"]), reply_markup=user_keyboard())
-        await services.send_config(m.bot, ovpn, m.chat.id, c["name"], texts.KEY_CAPTION)
+        await services.send_config(m.bot, fleet, m.chat.id, c, texts.KEY_CAPTION)
 
     @r.message(Command("key"))
     @r.message(F.text == texts.BTN_KEY)
-    async def btn_key(m: Message, db: DB, ovpn: OpenVPN):
+    async def btn_key(m: Message, db: DB, fleet: Fleet):
         keys = db.clients_of(m.from_user.id)
         if not keys:
             return await m.answer(texts.NO_KEYS)
         for c in keys:
-            await services.send_config(m.bot, ovpn, m.chat.id, c["name"], texts.KEY_CAPTION)
+            if not await services.send_config(m.bot, fleet, m.chat.id, c, texts.KEY_CAPTION):
+                await m.answer("⚠️ Сервер временно недоступен, попробуйте через пару минут.")
 
     @r.message(F.text == texts.BTN_SUB)
     async def btn_sub(m: Message, db: DB):
@@ -508,8 +680,7 @@ def build_user_router() -> Router:
         if not keys:
             return await m.answer(texts.NO_KEYS)
         await m.answer("\n".join(
-            texts.SUB_LINE.format(name=c["name"], until=services.fmt_until(c["expires_at"]))
-            for c in keys))
+            texts.SUB_LINE.format(name=c["name"], until=services.fmt_until(c["expires_at"])) for c in keys))
 
     @r.message(F.text == texts.BTN_HOWTO)
     async def btn_howto(m: Message):
