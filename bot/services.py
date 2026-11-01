@@ -107,6 +107,21 @@ async def revoke(bot: Bot, db: DB, ovpn: OpenVPN, name: str, user_text: Optional
     return had_cert
 
 
+def sync_from_easyrsa(db: DB, ovpn: OpenVPN) -> tuple[list[str], list[str]]:
+    """Подтягивает ключи, созданные скриптом вручную, и помечает отозванные вне бота."""
+    valid = set(ovpn.valid_clients())
+    added = []
+    for name in sorted(valid):
+        row = db.get(name)
+        if row is None or row["status"] != "active":
+            db.add_client(name, note="создан скриптом")
+            added.append(name)
+    gone = [c["name"] for c in db.active() if c["name"] not in valid]
+    for name in gone:
+        db.set_status(name, "revoked")
+    return added, gone
+
+
 # ---------- фоновые задачи ----------
 async def ip_watch_loop(bot: Bot, db: DB, ovpn: OpenVPN, cfg: Config) -> None:
     """Каждые IP_CHECK_INTERVAL секунд сверяет реальный IP с адресом в ключах."""

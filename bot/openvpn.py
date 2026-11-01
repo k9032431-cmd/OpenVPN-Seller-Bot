@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 HOST_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$")
 CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
 REMOTE_RE = re.compile(r"^remote[ \t]+(\S+)[ \t]+(\d+)[ \t]*$", re.M)
@@ -106,7 +106,7 @@ class OpenVPN:
 
     async def create_client(self, name: str) -> None:
         if not NAME_RE.match(name):
-            raise OpenVPNError("Имя может содержать только латиницу, цифры, _ и - (до 64 символов).")
+            raise OpenVPNError("Имя может содержать только латиницу, цифры, _ и - (до 32 символов).")
         async with self.lock:
             if self.is_valid_client(name):
                 raise OpenVPNError(

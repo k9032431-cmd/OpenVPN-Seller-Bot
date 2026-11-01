@@ -12,7 +12,7 @@ from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefaul
 from . import services
 from .config import load_config
 from .db import DB
-from .handlers import build_admin_router, build_user_router
+from .handlers import admin_keyboard, build_admin_router, build_user_router
 from .openvpn import OpenVPN
 
 USER_COMMANDS = [
@@ -61,8 +61,20 @@ async def main() -> None:
     if cfg.ip_auto_update:
         tasks.append(asyncio.create_task(services.ip_watch_loop(bot, db, ovpn, cfg)))
 
+    added, _ = services.sync_from_easyrsa(db, ovpn)
     host, port = ovpn.get_remote()
     logging.info("Бот @%s запущен. Адрес в ключах: %s:%s", me.username, host, port)
+    for admin in cfg.admin_ids:
+        try:
+            await bot.send_message(
+                admin,
+                f"✅ Бот запущен. Адрес сервера в ключах: <code>{host}:{port}</code>\n"
+                + (f"Найдено ключей, созданных скриптом: {len(added)}\n" if added else "")
+                + "Нажмите «❓ Как это работает», если впервые.",
+                reply_markup=admin_keyboard(),
+            )
+        except Exception as e:
+            logging.warning("Не удалось написать админу %s: %s", admin, e)
     try:
         await dp.start_polling(bot, db=db, ovpn=ovpn, cfg=cfg, bot_username=me.username)
     finally:
