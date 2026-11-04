@@ -1,4 +1,4 @@
-"""SQLite-хранилище: серверы и ключи клиентов."""
+"""SQLite-хранилище: скрипты, серверы и ключи клиентов."""
 from __future__ import annotations
 
 import secrets
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS servers (
 CREATE TABLE IF NOT EXISTS clients (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id    INTEGER,
-    name         TEXT    NOT NULL,               -- имя сертификата (CN) в easy-rsa
+    name         TEXT    NOT NULL,               -- название ключа ({name} в шагах)
     tg_id        INTEGER,                        -- Telegram ID владельца ключа
     tg_username  TEXT,
     invite_token TEXT    UNIQUE,                 -- токен из ссылки t.me/bot?start=...
@@ -33,7 +33,37 @@ CREATE TABLE IF NOT EXISTS clients (
 );
 CREATE INDEX IF NOT EXISTS idx_clients_tg ON clients(tg_id);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS scripts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL,
+    filename      TEXT,                          -- файл, загружаемый в ~/vpnbot
+    content       BLOB,
+    source_url    TEXT,
+    install_steps TEXT NOT NULL DEFAULT '',      -- строки, которые «печатаются» в терминал
+    check_cmd     TEXT NOT NULL DEFAULT '',      -- успешна → установка уже есть
+    key_steps     TEXT NOT NULL DEFAULT '',
+    result_type   TEXT NOT NULL DEFAULT 'file',  -- file | output
+    result_path   TEXT NOT NULL DEFAULT '',      -- напр. /root/{name}.ovpn
+    key_regex     TEXT NOT NULL DEFAULT '',
+    delete_steps  TEXT NOT NULL DEFAULT '',
+    ip_steps      TEXT NOT NULL DEFAULT '',      -- команды при смене IP сервера
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    version       INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_scripts (
+    server_id INTEGER NOT NULL,
+    script_id INTEGER NOT NULL,
+    version   INTEGER NOT NULL,
+    PRIMARY KEY (server_id, script_id)
+);
 """
+
+CLIENT_COLUMNS = {"script_id": "INTEGER", "value": "BLOB", "filename": "TEXT"}
+SCRIPT_FIELDS = {"name", "filename", "content", "source_url", "install_steps", "check_cmd", "key_steps",
+                 "result_type", "result_path", "key_regex", "delete_steps", "ip_steps", "enabled"}
+# изменение этих полей требует повторной установки на серверах
+REINSTALL_FIELDS = {"filename", "content", "install_steps", "check_cmd"}
 
 DAY = 86400
 
@@ -49,6 +79,10 @@ class DB:
         self._migrate()
         with self.conn:
             self.conn.executescript(SCHEMA)
+            have = {r[1] for r in self.conn.execute("PRAGMA table_info(clients)")}
+            for col, typ in CLIENT_COLUMNS.items():
+                if col not in have:
+                    self.conn.execute(f"ALTER TABLE clients ADD COLUMN {col} {typ}")
 
     def _migrate(self) -> None:
         """Старая версия базы (без серверов) → новая."""
@@ -79,9 +113,6 @@ class DB:
     def servers(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM servers ORDER BY id").fetchall()
 
-    def local_server(self) -> Optional[sqlite3.Row]:
-        return self.conn.execute("SELECT * FROM servers WHERE kind='local'").fetchone()
-
     def set_server_host(self, sid: int, host: str) -> None:
         with self.conn:
             self.conn.execute("UPDATE servers SET host=? WHERE id=?", (host, sid))
@@ -89,11 +120,8 @@ class DB:
     def delete_server(self, sid: int) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM clients WHERE server_id=?", (sid,))
+            self.conn.execute("DELETE FROM server_scripts WHERE server_id=?", (sid,))
             self.conn.execute("DELETE FROM servers WHERE id=?", (sid,))
-
-    def assign_orphans(self, sid: int) -> None:
-        with self.conn:
-            self.conn.execute("UPDATE clients SET server_id=? WHERE server_id IS NULL", (sid,))
 
     def count_active(self, sid: int) -> int:
         return self.conn.execute(
@@ -110,20 +138,34 @@ class DB:
     def get_by_token(self, token: str) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM clients WHERE invite_token=?", (token,)).fetchone()
 
-    def add_client(self, sid: int, name: str, days: int = 0, note: Optional[str] = None) -> int:
+    def add_client(self, sid: int, script_id: int, name: str, value: bytes, filename: Optional[str],
+                   days: int = 0, note: Optional[str] = None) -> int:
         now = int(time.time())
         expires = now + days * DAY if days > 0 else None
         with self.conn:
             self.conn.execute(
                 "DELETE FROM clients WHERE server_id=? AND name=? AND status='revoked'", (sid, name))
             cur = self.conn.execute(
-                "INSERT INTO clients(server_id, name, invite_token, note, created_at, expires_at)"
-                " VALUES (?,?,?,?,?,?)", (sid, name, new_token(), note, now, expires))
+                "INSERT INTO clients(server_id, script_id, name, value, filename, invite_token, note,"
+                " created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (sid, script_id, name, value, filename, new_token(), note, now, expires))
         return cur.lastrowid
 
-    def move_client(self, cid: int, sid: int, name: str) -> None:
+    def name_taken(self, sid: int, name: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM clients WHERE server_id=? AND name=?",
+                                 (sid, name)).fetchone() is not None
+
+    def move_client(self, cid: int, sid: int, name: str, value: bytes, filename: Optional[str]) -> None:
         with self.conn:
-            self.conn.execute("UPDATE clients SET server_id=?, name=? WHERE id=?", (sid, name, cid))
+            self.conn.execute("UPDATE clients SET server_id=?, name=?, value=?, filename=? WHERE id=?",
+                              (sid, name, value, filename, cid))
+
+    def set_value(self, cid: int, value: bytes) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE clients SET value=? WHERE id=?", (value, cid))
+
+    def server_clients(self, sid: int) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM clients WHERE server_id=?", (sid,)).fetchall()
 
     def bind(self, cid: int, tg_id: int, username: Optional[str]) -> None:
         with self.conn:
@@ -188,3 +230,61 @@ class DB:
         return self.conn.execute(
             "SELECT * FROM clients WHERE status='active' AND warned=0"
             " AND expires_at IS NOT NULL AND expires_at<=?", (until,)).fetchall()
+
+    # ---------- скрипты ----------
+    def add_script(self, **fields) -> int:
+        fields = {k: v for k, v in fields.items() if k in SCRIPT_FIELDS}
+        cols = ", ".join(fields) + ", created_at"
+        marks = ", ".join("?" * len(fields)) + ", ?"
+        with self.conn:
+            cur = self.conn.execute(f"INSERT INTO scripts ({cols}) VALUES ({marks})",
+                                    (*fields.values(), int(time.time())))
+        return cur.lastrowid
+
+    def script(self, script_id) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM scripts WHERE id=?", (script_id,)).fetchone()
+
+    def scripts(self, only_enabled: bool = False) -> list[sqlite3.Row]:
+        where = "WHERE enabled=1" if only_enabled else ""
+        return self.conn.execute(f"SELECT * FROM scripts {where} ORDER BY id").fetchall()
+
+    def update_script(self, script_id: int, **fields) -> None:
+        fields = {k: v for k, v in fields.items() if k in SCRIPT_FIELDS}
+        if not fields:
+            return
+        sets = ", ".join(f"{k}=?" for k in fields)
+        if REINSTALL_FIELDS & fields.keys():
+            sets += ", version=version+1"
+        with self.conn:
+            self.conn.execute(f"UPDATE scripts SET {sets} WHERE id=?", (*fields.values(), script_id))
+
+    def bump_script(self, script_id: int) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE scripts SET version=version+1 WHERE id=?", (script_id,))
+
+    def delete_script(self, script_id: int) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM server_scripts WHERE script_id=?", (script_id,))
+            self.conn.execute("UPDATE clients SET script_id=NULL WHERE script_id=?", (script_id,))
+            self.conn.execute("DELETE FROM scripts WHERE id=?", (script_id,))
+
+    def installed_version(self, sid: int, script_id: int) -> Optional[int]:
+        row = self.conn.execute("SELECT version FROM server_scripts WHERE server_id=? AND script_id=?",
+                                (sid, script_id)).fetchone()
+        return row[0] if row else None
+
+    def set_installed(self, sid: int, script_id: int, version: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO server_scripts(server_id, script_id, version) VALUES (?,?,?)"
+                " ON CONFLICT(server_id, script_id) DO UPDATE SET version=excluded.version",
+                (sid, script_id, version))
+
+    def installed_scripts(self, sid: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT sc.* FROM scripts sc JOIN server_scripts ss ON ss.script_id=sc.id WHERE ss.server_id=?",
+            (sid,)).fetchall()
+
+    def script_servers(self, script_id: int, version: int) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM server_scripts WHERE script_id=? AND version=?",
+                                 (script_id, version)).fetchone()[0]

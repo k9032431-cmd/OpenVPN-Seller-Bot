@@ -1,4 +1,4 @@
-"""Выполнение команд на VPN-серверах: локально (бот стоит на этом же сервере) или по SSH.
+"""Подключение к VPN-серверам по SSH.
 
 Как бот получает доступ к серверу:
   1. Админ один раз вводит пароль root в боте.
@@ -16,40 +16,19 @@ from typing import Optional
 
 import asyncssh
 
+from .steps import PREP, OnStep, SessionResult, run_session
+
 log = logging.getLogger(__name__)
 
 SSH_PATH = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
+MAX_FILE = 20 * 1024 * 1024
 
 
 class RemoteError(RuntimeError):
     pass
 
 
-class Executor:
-    async def run(self, cmd: str, input: str = "", timeout: int = 120) -> tuple[int, str]:
-        raise NotImplementedError
-
-    async def close(self) -> None:
-        pass
-
-
-class LocalExecutor(Executor):
-    async def run(self, cmd: str, input: str = "", timeout: int = 120) -> tuple[int, str]:
-        proc = await asyncio.create_subprocess_exec(
-            "bash", "-c", cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(input.encode()), timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise RemoteError(f"Команда не завершилась за {timeout} с")
-        return proc.returncode, out.decode(errors="replace")
-
-
-def _stdin(input: str) -> dict:
+def _stdin(input) -> dict:
     # asyncssh не закрывает stdin при пустом input — команда, читающая stdin, зависла бы
     return {"input": input} if input else {"stdin": asyncssh.DEVNULL}
 
@@ -61,7 +40,9 @@ def _known_hosts(host: str, port: int, host_key: Optional[str]):
     return asyncssh.import_known_hosts(f"{spec} {host_key}\n")
 
 
-class SSHExecutor(Executor):
+class Server:
+    """Одно SSH-подключение к серверу (переиспользуется между командами)."""
+
     def __init__(self, host: str, port: int, user: str, host_key: Optional[str],
                  client_key: asyncssh.SSHKey):
         self.host, self.port, self.user = host, port, user
@@ -69,37 +50,83 @@ class SSHExecutor(Executor):
         self.client_key = client_key
         self._conn: Optional[asyncssh.SSHClientConnection] = None
         self._lock = asyncio.Lock()
+        self.busy = asyncio.Lock()   # одна «тяжёлая» операция (установка/ключ) за раз
 
-    async def _connect(self) -> asyncssh.SSHClientConnection:
+    async def connect(self) -> asyncssh.SSHClientConnection:
         async with self._lock:
             if self._conn is None or self._conn.is_closed():
-                self._conn = await asyncio.wait_for(asyncssh.connect(
-                    self.host, port=self.port, username=self.user,
-                    client_keys=[self.client_key], agent_path=None, password=None,
-                    known_hosts=_known_hosts(self.host, self.port, self.host_key),
-                    keepalive_interval=30,
-                ), 20)
+                try:
+                    self._conn = await asyncio.wait_for(asyncssh.connect(
+                        self.host, port=self.port, username=self.user,
+                        client_keys=[self.client_key], agent_path=None, password=None,
+                        known_hosts=_known_hosts(self.host, self.port, self.host_key),
+                        keepalive_interval=30,
+                    ), 20)
+                except asyncssh.HostKeyNotVerifiable as e:
+                    raise RemoteError(f"Ключ сервера {self.host} изменился. Если это другой сервер — "
+                                      "удалите его в боте и добавьте заново.") from e
+                except asyncssh.PermissionDenied as e:
+                    raise RemoteError(f"Сервер {self.host} не пускает бота по ключу. Удалите сервер "
+                                      "в боте и добавьте заново с паролем.") from e
+                except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
+                    raise RemoteError(f"Нет связи с {self.host}: {e or type(e).__name__}") from e
             return self._conn
 
-    async def run(self, cmd: str, input: str = "", timeout: int = 120) -> tuple[int, str]:
+    async def _retry(self, fn):
         for attempt in (1, 2):
             try:
-                conn = await self._connect()
-                r = await conn.run(SSH_PATH + cmd, timeout=timeout, stderr=asyncssh.STDOUT,
-                                   **_stdin(input))
-                code = r.exit_status if r.exit_status is not None else 255
-                return code, str(r.stdout or "")
-            except asyncssh.TimeoutError:
-                raise RemoteError(f"Команда на {self.host} не завершилась за {timeout} с")
-            except asyncssh.HostKeyNotVerifiable:
-                await self.close()
-                raise RemoteError(f"Ключ сервера {self.host} изменился. Если это новый сервер — "
-                                  "удалите его в боте и добавьте заново.")
-            except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
+                return await fn(await self.connect())
+            except asyncssh.TimeoutError as e:
+                raise RemoteError(f"Команда на {self.host} не завершилась вовремя") from e
+            except (OSError, asyncssh.Error) as e:
                 await self.close()
                 if attempt == 2:
                     raise RemoteError(f"Нет связи с {self.host}: {e or type(e).__name__}") from e
-        raise AssertionError("unreachable")
+
+    async def run(self, cmd: str, timeout: int = 120, input: str = "") -> tuple[int, str]:
+        """Команда в папке ~/vpnbot. Возвращает (код, вывод)."""
+        async def go(conn):
+            r = await conn.run(SSH_PATH + PREP + cmd, timeout=timeout, stderr=asyncssh.STDOUT, **_stdin(input))
+            return (r.exit_status if r.exit_status is not None else 255), str(r.stdout or "")
+        return await self._retry(go)
+
+    async def upload(self, name: str, content: bytes) -> None:
+        """Кладёт файл в ~/vpnbot/ и делает его исполняемым."""
+        path = '"$VPNB_DIR"/' + shlex.quote(name)
+
+        async def go(conn):
+            r = await conn.run(SSH_PATH + PREP + f"cat > {path} && chmod +x {path}",
+                               input=content, encoding=None)
+            if r.exit_status:
+                raise RemoteError(f"Не удалось загрузить {name}: {(r.stderr or b'').decode(errors='replace')}")
+        await self._retry(go)
+
+    async def read_file(self, path: str) -> bytes:
+        rel = path[2:] if path.startswith("~/") else path
+        sh = shlex.quote(rel) if rel.startswith("/") else '"$HOME"/' + shlex.quote(rel)
+
+        async def go(conn):
+            r = await conn.run(SSH_PATH + f"cat -- {sh}", stdin=asyncssh.DEVNULL, encoding=None)
+            if r.exit_status:
+                raise RemoteError(f"Файл не найден на сервере: {path}")
+            if len(r.stdout) > MAX_FILE:
+                raise RemoteError("Файл ключа слишком большой")
+            return r.stdout
+        return await self._retry(go)
+
+    async def session(self, lines: list[str], timeout: int, on_step: OnStep | None = None) -> SessionResult:
+        # без повтора: если связь оборвалась посреди установки, запускать её заново вслепую нельзя
+        conn = await self.connect()
+        try:
+            return await run_session(conn, lines, timeout, on_step)
+        except (OSError, asyncssh.Error) as e:
+            await self.close()
+            raise RemoteError(f"Связь с {self.host} прервалась: {e or type(e).__name__}") from e
+
+    async def ping(self) -> None:
+        code, out = await self.run("id -u", timeout=30)
+        if out.strip() != "0":
+            raise RemoteError(f"На {self.host} нет прав root")
 
     async def close(self) -> None:
         if self._conn is not None:
