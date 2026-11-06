@@ -15,8 +15,8 @@ from .db import DB
 from .remote import RemoteError, Server, load_client_key, public_key_line
 from .steps import DIR_SH, ENTER_WORDS, fill, session_output, steps_of
 
-INSTALL_TIMEOUT = 1800
-KEY_TIMEOUT = 300
+INSTALL_TIMEOUT = 7200   # установка может идти долго (apt, генерация DH) — ждём до 2 часов
+KEY_TIMEOUT = 900
 HOST_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
@@ -81,12 +81,23 @@ def placeholders(server, script, name: str = "") -> dict[str, str]:
     return {"name": name, "server_ip": server["host"], "dir": DIR_SH, "file": file, "script": file}
 
 
-def stepper(progress: Progress, title: str, total: int):
-    async def on_step(i: int, line: str):
+class stepper:
+    """Показывает в боте текущий шаг, а пока скрипт долго работает — что у него на экране."""
+
+    def __init__(self, progress: Progress, title: str, total: int):
+        self.progress, self.title, self.total = progress, title, total
+        self.step = ""
+
+    async def on_step(self, i: int, line: str):
         shown = "Enter" if line.strip().lower() in ENTER_WORDS else line
         shown = shown if len(shown) <= 50 else shown[:47] + "…"
-        await progress(f"🚀 {title}: шаг {i}/{total} · {shown}")
-    return on_step
+        self.step = f"шаг {i}/{self.total} · {shown}"
+        await self.progress(f"🚀 {self.title}: {self.step}")
+
+    async def on_output(self, seconds: int, line: str):
+        took = f"{seconds // 60}:{seconds % 60:02d}"
+        await self.progress(f"🚀 {self.title}: {self.step}\n⌛ Скрипт работает {took} — не закрывайте, ждём.\n"
+                            f"На экране: {line or '…'}")
 
 
 async def is_installed(fleet: Fleet, db: DB, server, script) -> bool:
@@ -115,7 +126,8 @@ async def install(fleet: Fleet, db: DB, server, script, progress: Progress = _no
     steps = steps_of(script["install_steps"], values)
     if steps:
         await progress(f"🚀 Установка: начинаю ({len(steps)} шаг.)")
-        res = await r.session(steps, INSTALL_TIMEOUT, stepper(progress, "Установка", len(steps)))
+        st = stepper(progress, "Установка", len(steps))
+        res = await r.session(steps, INSTALL_TIMEOUT, st.on_step, st.on_output)
         if not res.ok:
             raise EngineError(f"Установка: {res.error}", res.tail())
         if script["check_cmd"].strip():
@@ -146,7 +158,8 @@ async def create_key(fleet: Fleet, db: DB, server, script, name: str,
         if not steps:
             raise EngineError("У скрипта не заданы шаги создания ключа")
         await progress(f"🔑 Создаю ключ {name}…")
-        res = await r.session(steps, KEY_TIMEOUT, stepper(progress, "Ключ", len(steps)))
+        st = stepper(progress, "Ключ", len(steps))
+        res = await r.session(steps, KEY_TIMEOUT, st.on_step, st.on_output)
         if not res.ok:
             raise EngineError(f"Создание ключа: {res.error}", res.tail())
         if script["result_type"] == "file":

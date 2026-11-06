@@ -91,14 +91,25 @@ class _Stuck(Exception):
 
 
 OnStep = Callable[[int, str], Awaitable[None]]
+OnOutput = Callable[[int, str], Awaitable[None]]   # (секунд прошло, последняя строка экрана)
+HEARTBEAT = 15.0
+
+
+class _Silent(Exception):
+    pass
 
 
 async def run_session(conn: asyncssh.SSHClientConnection, lines: list[str], timeout: int,
-                      on_step: OnStep | None = None, idle: float = 1.5, stuck: float = 45.0) -> SessionResult:
+                      on_step: OnStep | None = None, idle: float = 1.5, stuck: float = 45.0,
+                      on_output: OnOutput | None = None, silent: float = 1200.0) -> SessionResult:
     """Открывает терминал с bash и «печатает» строки по одной (вход под root).
 
     Строка отправляется, когда терминал ждёт ввода: вывод затих, а последняя строка экрана
     похожа на вопрос. Если команда завершилась с ошибкой — сессия прерывается (set -e).
+
+    Долгая работа (apt, генерация ключей) — это нормально: пока скрипт что-то выводит, бот ждёт
+    (до timeout) и раз в 15 с сообщает через on_output, что сейчас на экране. Ошибка — только
+    если скрипт молчит дольше silent секунд.
     """
     cmd = (f"{PREP}exec env VPNB_DIR=\"$VPNB_DIR\" PS1={shlex.quote(READY + ' ')} PS2='' HISTFILE=/dev/null "
            f"DEBIAN_FRONTEND=noninteractive TERM=xterm bash --norc --noprofile -i")
@@ -122,7 +133,9 @@ async def run_session(conn: asyncssh.SSHClientConnection, lines: list[str], time
             state["closed"] = True
 
     task = asyncio.create_task(reader())
-    deadline = time.monotonic() + timeout
+    started_at = time.monotonic()
+    deadline = started_at + timeout
+    beat = {"next": started_at + HEARTBEAT}
 
     def text() -> str:
         return "".join(raw)
@@ -132,6 +145,13 @@ async def run_session(conn: asyncssh.SSHClientConnection, lines: list[str], time
         if t.endswith("\n"):
             return ""
         return _CTRL.sub("", t.rsplit("\n", 1)[-1].rsplit("\r", 1)[-1]).strip()
+
+    def last_line() -> str:
+        """Последняя непустая строка экрана — чтобы показать, чем занят скрипт."""
+        for line in reversed(clean(text()[-3000:]).splitlines()):
+            if line.strip() and not line.startswith(READY):
+                return line.strip()[-70:]
+        return ""
 
     async def wait_input(max_wait: float | None = None) -> str | None:
         """Ждёт, пока терминал запросит ввод. None — процесс завершился."""
@@ -144,6 +164,11 @@ async def run_session(conn: asyncssh.SSHClientConnection, lines: list[str], time
                 raise asyncio.TimeoutError
             if max_wait is not None and now - started > max_wait:
                 raise _Stuck(screen_tail())
+            if now - state["last"] > silent:
+                raise _Silent()
+            if on_output and now >= beat["next"]:
+                beat["next"] = now + HEARTBEAT
+                await on_output(int(now - started_at), last_line())
             if now - state["last"] >= idle:
                 tail = screen_tail()
                 if is_prompt(tail):
@@ -224,12 +249,9 @@ async def run_session(conn: asyncssh.SSHClientConnection, lines: list[str], time
             send(tail, line)
             i += 1
 
-        # все строки введены — ждём возврата в shell
+        # все строки введены — ждём возврата в shell (скрипт может ещё долго работать — это нормально)
         while True:
-            try:
-                tail = await wait_input(max_wait=stuck)
-            except _Stuck as exc:
-                return result(False, f"Скрипт ждёт ввода, а шаги закончились: «{exc.tail}»")
+            tail = await wait_input()
             if tail is None:
                 return result(False, "Сессия завершилась с ошибкой")
             if tail.startswith(READY):
@@ -251,7 +273,10 @@ async def run_session(conn: asyncssh.SSHClientConnection, lines: list[str], time
             pass
         return result(True)
     except asyncio.TimeoutError:
-        return result(False, f"Не уложились в {timeout} сек.")
+        return result(False, f"Не уложились в {timeout // 60} мин.")
+    except _Silent:
+        return result(False, f"Скрипт ничего не выводит {int(silent // 60)} мин — похоже, завис. "
+                             f"Последнее на экране: «{last_line()}»")
     finally:
         if not state["closed"]:
             proc.close()

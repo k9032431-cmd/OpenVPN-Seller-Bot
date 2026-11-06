@@ -294,7 +294,7 @@ def build_admin_router(cfg: Config) -> Router:
             return await cb.answer("На сервере уже идёт операция", show_alert=True)
         await cb.answer()
         live = Live(cb.message, f"⚙️ <b>Установка {esc(script['name'])}</b> · 🖥 {esc(server['name'])}\n"
-                                "Обычно 2–5 минут. Можно пользоваться ботом, я обновлю это сообщение.\n\n")
+                                "Обычно 5–30 минут (на слабом сервере генерация ключей шифрования идёт долго).\nМожно пользоваться ботом — я обновляю это сообщение.\n\n")
 
         async def job():
             fleet.busy.add(server["id"])

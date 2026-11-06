@@ -16,7 +16,7 @@ from typing import Optional
 
 import asyncssh
 
-from .steps import PREP, OnStep, SessionResult, run_session
+from .steps import PREP, OnOutput, OnStep, SessionResult, run_session
 
 log = logging.getLogger(__name__)
 
@@ -114,11 +114,12 @@ class Server:
             return r.stdout
         return await self._retry(go)
 
-    async def session(self, lines: list[str], timeout: int, on_step: OnStep | None = None) -> SessionResult:
+    async def session(self, lines: list[str], timeout: int, on_step: OnStep | None = None,
+                      on_output: OnOutput | None = None) -> SessionResult:
         # без повтора: если связь оборвалась посреди установки, запускать её заново вслепую нельзя
         conn = await self.connect()
         try:
-            return await run_session(conn, lines, timeout, on_step)
+            return await run_session(conn, lines, timeout, on_step, on_output=on_output)
         except (OSError, asyncssh.Error) as e:
             await self.close()
             raise RemoteError(f"Связь с {self.host} прервалась: {e or type(e).__name__}") from e
