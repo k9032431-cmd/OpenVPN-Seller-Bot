@@ -31,6 +31,19 @@ ENTER_WORDS = {"enter", "{enter}", "<enter>", "⏎", "↵"}
 RULE_RE = re.compile(r"^\s*\?\s*(.+?)\s*=>\s*(.*)$")
 _ANY_KEY = re.compile(r"any key|любую клавишу|istalan|basyň", re.I)
 _LETTER = re.compile(r"[^\W\d_]")
+# Строки прогресса — это не вопрос скрипта, а «идёт работа»: apt (0% [Working], Get:1 …,
+# Waiting for cache lock), wget/curl (45%[====>  ] 1.2MB/s), dpkg (Progress: [ 40%]).
+# Пока на экране такая строка — бот ждёт, а не вводит следующий шаг.
+_PROGRESS = re.compile(
+    r"\d{1,3}(?:[.,]\d+)?\s*%|\[Working\]|\[Connecting|\[Waiting for headers\]|Waiting for cache lock"
+    r"|^(?:Get|Hit|Ign|Err):\d+\s|^Fetched\s|^Reading |^Building |\d+(?:\.\d+)?\s*[KMG]i?B/s|\bETA\b",
+    re.I,
+)
+
+
+def is_prompt(tail: str) -> bool:
+    """Похожа ли последняя строка экрана на вопрос, который ждёт ответа."""
+    return bool(tail) and bool(_LETTER.search(tail)) and not _PROGRESS.search(tail)
 _ESC = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78DEHM]")
 _CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -133,7 +146,7 @@ async def run_session(conn: asyncssh.SSHClientConnection, lines: list[str], time
                 raise _Stuck(screen_tail())
             if now - state["last"] >= idle:
                 tail = screen_tail()
-                if tail and _LETTER.search(tail):
+                if is_prompt(tail):
                     return tail
             await asyncio.sleep(0.2)
 
