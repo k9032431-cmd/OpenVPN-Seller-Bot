@@ -103,23 +103,46 @@ async def tell_dealer(bot: Bot, db: DB, client, text: str) -> None:
 
 
 # ---------- смена IP ----------
-async def change_address(bot: Bot, db: DB, fleet: Fleet, sid: int, new_host: str,
-                         progress: Progress = _noop) -> tuple[int, int, int, list[str]]:
-    """Сервер переехал на новый IP: подключиться по новому адресу → шаги «Смена IP» на сервере →
-    заменить IP во всех ключах → разослать клиентам. → (обновлено ключей, отправлено, ошибок, предупреждения)."""
+async def switch_host(db: DB, fleet: Fleet, sid: int, new_host: str, host_key: Optional[str] = None) -> str:
+    """Переключает сервер на новый IP, если бот может туда войти. → старый IP.
+
+    Не вышло — IP остаётся прежним, ошибка пробрасывается: RemoteAuthError / RemoteHostKeyError
+    (нужен пароль — похоже, это новый сервер) или RemoteError (не отвечает и т.п.).
+    """
     server = db.server(sid)
-    old = server["host"]
-    db.set_server_host(sid, new_host)
-    moved = db.server(sid)
+    old_host, old_key = server["host"], server["host_key"]
+    db.set_server_access(sid, new_host, host_key if host_key is not None else old_key)
+    fleet.forget(sid)
     try:
-        await fleet.remote(moved).ping()
+        await fleet.remote(db.server(sid)).ping()
     except RemoteError:
-        db.set_server_host(sid, old)
+        db.set_server_access(sid, old_host, old_key)
         fleet.forget(sid)
         raise
-    await progress("✅ Подключение по новому IP работает, IP сохранён")
-    warnings = await engine.change_ip_on_server(fleet, db, moved, old, new_host, progress)
+    if server["name"] == old_host:  # сервер был назван по IP — переименуем
+        db.rename_server(sid, new_host)
+    return old_host
 
+
+async def missing_vpn(db: DB, fleet: Fleet, sid: int) -> list[str]:
+    """Скрипты, которые по базе стоят на сервере, но «Проверка установки» их не находит
+    (значит, на этом IP другой — новый — сервер)."""
+    server = db.server(sid)
+    missing = []
+    for script in db.installed_scripts(sid):
+        if script["check_cmd"].strip() and not await engine.is_installed(fleet, db, server, script):
+            missing.append(script["name"])
+    return missing
+
+
+async def change_address(bot: Bot, db: DB, fleet: Fleet, sid: int, old: str,
+                         progress: Progress = _noop) -> tuple[int, int, int, list[str]]:
+    """Тот же сервер, новый IP (бот уже подключён): шаги «Смена IP» на сервере → заменить IP во всех
+    ключах → разослать клиентам и диллерам. → (обновлено ключей, отправлено, ошибок, предупреждения)."""
+    server = db.server(sid)
+    new_host = server["host"]
+    await progress("✅ Подключение по новому IP работает, IP сохранён")
+    warnings = await engine.change_ip_on_server(fleet, db, server, old, new_host, progress)
     updated = 0
     old_b, new_b = old.encode(), new_host.encode()
     for c in db.server_clients(sid):
@@ -132,6 +155,35 @@ async def change_address(bot: Bot, db: DB, fleet: Fleet, sid: int, new_host: str
     await notify_dealers(bot, db, db.active(sid), texts.DEALER_IP_CHANGED.format(
         server=esc(server["name"]), old=old, new=esc(new_host)))
     return updated, ok, fail, warnings
+
+
+async def rebuild_server(bot: Bot, db: DB, fleet: Fleet, sid: int,
+                         progress: Progress = _noop) -> tuple[int, list[str]]:
+    """На месте сервера — новый (например, новый инстанс AWS): поставить VPN заново и пересоздать
+    ключи всем активным клиентам с теми же именами и сроками. Клиенты и диллеры получат новые файлы."""
+    db.reset_installed(sid)
+    server = db.server(sid)
+    clients = db.active(sid)
+    ok, errors, done = 0, [], []
+    for i, c in enumerate(clients, 1):
+        script = db.script(c["script_id"]) or next(iter(db.scripts(only_enabled=True)), None)
+        if script is None:
+            errors.append(f"{c['name']}: нет скрипта")
+            continue
+        await progress(f"🔑 {i}/{len(clients)}: {c['name']}")
+        try:
+            value, filename = await engine.create_key(fleet, db, server, script, c["name"], progress)
+        except ERRORS as e:
+            errors.append(f"{c['name']}: {e}")
+            continue
+        db.move_client(c["id"], sid, c["name"], value, filename)
+        fresh = db.get(c["id"])
+        done.append(fresh)
+        if fresh["tg_id"]:
+            await send_key(bot, fresh["tg_id"], fresh, texts.REBUILT_CAPTION)
+        ok += 1
+    await notify_dealers(bot, db, done, texts.DEALER_REBUILT.format(server=esc(server["name"])))
+    return ok, errors
 
 
 # ---------- перенос клиентов ----------

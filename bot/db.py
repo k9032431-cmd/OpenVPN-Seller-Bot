@@ -127,6 +127,19 @@ class DB:
         with self.conn:
             self.conn.execute("UPDATE servers SET host=? WHERE id=?", (host, sid))
 
+    def set_server_access(self, sid: int, host: str, host_key: Optional[str]) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE servers SET host=?, host_key=? WHERE id=?", (host, host_key, sid))
+
+    def rename_server(self, sid: int, name: str) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE servers SET name=? WHERE id=?", (name, sid))
+
+    def reset_installed(self, sid: int) -> None:
+        """Сервер заменён новым — скрипты нужно ставить заново."""
+        with self.conn:
+            self.conn.execute("DELETE FROM server_scripts WHERE server_id=?", (sid,))
+
     def delete_server(self, sid: int) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM clients WHERE server_id=?", (sid,))

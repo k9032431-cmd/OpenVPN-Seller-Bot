@@ -28,6 +28,25 @@ class RemoteError(RuntimeError):
     pass
 
 
+class RemoteAuthError(RemoteError):
+    """Сервер не пускает бота по его SSH-ключу (новый сервер или ключ удалили) — нужен пароль."""
+
+
+class RemoteHostKeyError(RemoteError):
+    """У сервера другой SSH-ключ — скорее всего, это другой (новый) сервер — нужен пароль."""
+
+
+def conn_error(host: str, port: int, e: BaseException) -> RemoteError:
+    """Понятный текст вместо «Нет связи с IP:» с пустой причиной."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return RemoteError(f"{host} не отвечает — проверьте IP и что сервер включён")
+    if isinstance(e, ConnectionRefusedError):
+        return RemoteError(f"{host}: порт {port} закрыт — SSH не принимает подключения")
+    if isinstance(e, OSError) and getattr(e, "errno", None) in (101, 113):
+        return RemoteError(f"{host} недоступен из сети — проверьте IP")
+    return RemoteError(f"Нет связи с {host}: {str(e) or type(e).__name__}")
+
+
 def _stdin(input) -> dict:
     # asyncssh не закрывает stdin при пустом input — команда, читающая stdin, зависла бы
     return {"input": input} if input else {"stdin": asyncssh.DEVNULL}
@@ -63,13 +82,12 @@ class Server:
                         keepalive_interval=30,
                     ), 20)
                 except asyncssh.HostKeyNotVerifiable as e:
-                    raise RemoteError(f"Ключ сервера {self.host} изменился. Если это другой сервер — "
-                                      "удалите его в боте и добавьте заново.") from e
+                    raise RemoteHostKeyError(f"У сервера {self.host} другой SSH-ключ — похоже, это новый сервер") from e
                 except asyncssh.PermissionDenied as e:
-                    raise RemoteError(f"Сервер {self.host} не пускает бота по ключу. Удалите сервер "
-                                      "в боте и добавьте заново с паролем.") from e
+                    raise RemoteAuthError(f"Сервер {self.host} не пускает бота по ключу — похоже, это новый "
+                                          "сервер или ключ бота удалён") from e
                 except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
-                    raise RemoteError(f"Нет связи с {self.host}: {e or type(e).__name__}") from e
+                    raise conn_error(self.host, self.port, e) from e
             return self._conn
 
     async def _retry(self, fn):
@@ -81,7 +99,7 @@ class Server:
             except (OSError, asyncssh.Error) as e:
                 await self.close()
                 if attempt == 2:
-                    raise RemoteError(f"Нет связи с {self.host}: {e or type(e).__name__}") from e
+                    raise conn_error(self.host, self.port, e) from e
 
     async def run(self, cmd: str, timeout: int = 120, input: str = "") -> tuple[int, str]:
         """Команда в папке ~/vpnbot. Возвращает (код, вывод)."""
@@ -124,10 +142,19 @@ class Server:
             await self.close()
             raise RemoteError(f"Связь с {self.host} прервалась: {e or type(e).__name__}") from e
 
-    async def ping(self) -> None:
-        code, out = await self.run("id -u", timeout=30)
-        if out.strip() != "0":
-            raise RemoteError(f"На {self.host} нет прав root")
+    async def ping(self, timeout: Optional[float] = None) -> None:
+        """Проверка связи. timeout — общий предел (для быстрых экранов), без него — с повтором."""
+        async def check():
+            code, out = await self.run("id -u", timeout=30)
+            if out.strip() != "0":
+                raise RemoteError(f"На {self.host} нет прав root")
+        if timeout is None:
+            return await check()
+        try:
+            await asyncio.wait_for(check(), timeout)
+        except asyncio.TimeoutError as e:
+            await self.close()
+            raise conn_error(self.host, self.port, e) from e
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -158,10 +185,9 @@ async def bootstrap_ssh(host: str, port: int, user: str, password: str, pubkey: 
             known_hosts=None, client_keys=None, agent_path=None,
         ), 25)
     except asyncssh.PermissionDenied:
-        raise RemoteError("Неверный логин или пароль.")
+        raise RemoteError("Неверный пароль — или на сервере запрещён вход root по паролю")
     except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
-        raise RemoteError(f"Не удалось подключиться к {host}:{port} — {e or type(e).__name__}. "
-                          "Проверьте IP и что сервер включён.")
+        raise conn_error(host, port, e)
     async with conn:
         r = await conn.run("id -u", stdin=asyncssh.DEVNULL)
         if str(r.stdout).strip() != "0":

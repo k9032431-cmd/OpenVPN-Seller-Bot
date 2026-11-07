@@ -26,7 +26,7 @@ from . import engine, services, texts
 from .config import Config
 from .db import DB
 from .engine import ERRORS, NAME_RE, Fleet, is_valid_host
-from .remote import RemoteError, bootstrap_ssh
+from .remote import RemoteAuthError, RemoteError, RemoteHostKeyError, bootstrap_ssh
 from .ui import (BTN_HOME, CANCEL, Live, fields, greet, ikb, nav, open_panel, pairs, screen, show)
 
 esc = html.escape
@@ -56,6 +56,7 @@ class AddServer(StatesGroup):
 
 class ChangeIP(StatesGroup):
     host = State()
+    password = State()
 
 
 class Broadcast(StatesGroup):
@@ -237,16 +238,17 @@ async def server_screen(db: DB, fleet: Fleet, sid: int, top: str = ""):
     if s is None:
         return screen("🖥 Сервер не найден"), ikb(nav("sl"))
     error = ""
-    try:
-        await fleet.remote(s).ping()
-    except RemoteError as e:
-        error = str(e)
+    if sid not in fleet.busy:
+        try:
+            await fleet.remote(s).ping(timeout=8)   # карточка открывается быстро, даже если сервер «мёртв»
+        except RemoteError as e:
+            error = str(e)
     busy = sid in fleet.busy
     status = "⏳ Идёт установка или перенос" if busy else ("⚠️ Нет связи" if error else "✅ На связи")
     info = fields(("Статус", status), ("IP", s["host"]), ("SSH", f"{s['user']}@{s['host']}:{s['port']}"),
                   ("Активных ключей", db.count_active(sid)))
     if error:
-        info += f"\n<i>{esc(error)}</i>"
+        info += f"\n<i>{esc(error)}</i>\n\n💡 Сменился IP сервера? Нажмите «✏️ Сменить IP»"
     rows: list = []
     vpn_lines = []
     for sc in db.scripts(only_enabled=True):
@@ -493,9 +495,19 @@ def build_admin_router(cfg: Config) -> Router:
     # ---------- смена IP ----------
     def ip_screen(server, error: str = ""):
         return screen(f"✏️ Смена IP · {esc(server['name'])}", fields(("Сейчас", server["host"])),
-                      "Напишите <b>новый IP</b> сервера. Пароль не нужен.",
-                      f"⚠️ {error}" if error else None,
+                      "Напишите <b>новый IP</b> сервера.",
+                      f"⚠️ {esc(error)}" if error else None,
                       hint="Бот подключится по новому IP, обновит ключи и сам разошлёт их клиентам и диллерам"), \
+            ikb(nav(f"s:{server['id']}"))
+
+    def password_screen(server, host: str, reason: str, error: str = ""):
+        return screen(f"🔐 Смена IP · {esc(server['name'])}",
+                      fields(("Новый IP", host)),
+                      f"⚠️ {esc(reason)}.",
+                      f"Напишите <b>пароль {server['user']}</b> от сервера на новом IP — бот подключится заново.\n"
+                      "<i>🔒 Сообщение с паролем сразу удалится, пароль не сохраняется.</i>",
+                      f"❌ {esc(error)}" if error else None,
+                      hint="На AWS при смене IP часто создаётся новый сервер — поэтому бот не может войти по старому ключу"), \
             ikb(nav(f"s:{server['id']}"))
 
     @r.callback_query(F.data.startswith("sc_ip:"))
@@ -515,20 +527,89 @@ def build_admin_router(cfg: Config) -> Router:
             return await show(m, *ip_screen(server, "Это не похоже на IP-адрес"))
         if host == server["host"]:
             return await show(m, *ip_screen(server, "Это текущий IP сервера"))
-        await state.clear()
-        header = screen(f"🌐 Смена IP · {esc(server['name'])}", f"<code>{server['host']}</code> → <code>{esc(host)}</code>")
-        panel = await show(m, header)
-        live = Live(panel, header)
-        await live(f"⏳ Подключаюсь к {host}…")
+        panel = await show(m, screen(f"🌐 Смена IP · {esc(server['name'])}", f"⏳ Подключаюсь к <b>{esc(host)}</b>…"))
         try:
-            updated, ok, fail, warnings = await services.change_address(bot, db, fleet, sid, host, live)
+            old = await services.switch_host(db, fleet, sid, host)
+        except (RemoteAuthError, RemoteHostKeyError) as e:  # новый сервер / ключ бота пропал — нужен пароль
+            await state.update_data(new_host=host, reason=str(e))
+            await state.set_state(ChangeIP.password)
+            text, kb = password_screen(server, host, str(e))
+            return await panel.edit_text(text, reply_markup=kb)
+        except RemoteError as e:                            # не отвечает и т.п. — можно ввести другой IP
+            text, kb = ip_screen(server, str(e))
+            return await panel.edit_text(text, reply_markup=kb)
+        await state.clear()
+        await after_switch(panel, db, fleet, bot, sid, old)
+
+    @r.message(ChangeIP.password, F.text)
+    async def change_ip_password(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot):
+        data = await state.get_data()
+        sid, host = data["sid"], data["new_host"]
+        server = db.server(sid)
+        panel = await show(m, screen(f"🔐 Смена IP · {esc(server['name'])}", f"⏳ Подключаюсь к <b>{esc(host)}</b>…"))
+        try:
+            host_key = await bootstrap_ssh(host, server["port"], server["user"], m.text, fleet.pubkey)
+            old = await services.switch_host(db, fleet, sid, host, host_key)
+        except RemoteError as e:
+            text, kb = password_screen(server, host, data["reason"], str(e))
+            return await panel.edit_text(text, reply_markup=kb)
+        await state.clear()
+        await after_switch(panel, db, fleet, bot, sid, old)
+
+    async def after_switch(panel: Message, db: DB, fleet: Fleet, bot: Bot, sid: int, old: str):
+        """IP уже переключён. Тот же сервер — обновляем ключи; новый (VPN нет) — предлагаем пересоздать."""
+        server = db.server(sid)
+        try:
+            missing = await services.missing_vpn(db, fleet, sid)
+        except ERRORS:
+            missing = []
+        if missing:
+            n = db.count_active(sid)
+            text = screen(f"🆕 Новый сервер · {esc(server['name'])}",
+                          fields(("Новый IP", server["host"]), ("Клиентов", n)),
+                          f"Бот подключился, но на сервере нет VPN ({esc(', '.join(missing))}) — "
+                          "значит, это новый сервер, и старые ключи на нём работать не будут.",
+                          "<b>Что сделает бот:</b>\n1. Установит VPN заново\n2. Создаст новые ключи всем клиентам "
+                          "с теми же именами и сроками\n3. Сам отправит их клиентам и диллерам",
+                          hint="Установка займёт 5–30 минут")
+            return await panel.edit_text(text, reply_markup=ikb(
+                [(f"✅ Установить VPN и пересоздать ключи ({n})", f"rb:{sid}")], nav(f"s:{sid}")))
+        header = screen(f"🌐 Смена IP · {esc(server['name'])}", f"<code>{old}</code> → <code>{server['host']}</code>")
+        live = Live(panel, header)
+        try:
+            updated, ok, fail, warnings = await services.change_address(bot, db, fleet, sid, old, live)
         except ERRORS as e:
-            return await live.fail(f"{e}\nIP не изменён. Если это другой (новый) сервер — добавьте его "
-                                   "и перенесите клиентов.", getattr(e, "output", ""), ikb(nav(f"s:{sid}")))
+            return await live.fail(str(e), getattr(e, "output", ""), ikb(nav(f"s:{sid}")))
         warn = "".join(f"\n⚠️ {esc(w)}" for w in warnings)
         await live.done("✅ <b>Готово</b>\n" + fields(("Обновлено ключей", updated), ("Отправлено клиентам", ok),
                                                      ("Не доставлено", fail)) + warn,
                         ikb([("🖥 К серверу", f"s:{sid}")], nav()))
+
+    @r.callback_query(F.data.startswith("rb:"))
+    async def cb_rebuild(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
+        sid = int(cb.data[3:])
+        if sid in fleet.busy:
+            return await cb.answer("На сервере уже идёт операция", show_alert=True)
+        await cb.answer("Запущено")
+        fleet.busy.add(sid)
+        server = db.server(sid)
+        await show(cb, *await server_screen(db, fleet, sid))
+        status = await bot.send_message(cb.message.chat.id, "⏳")
+        live = Live(status, screen(f"🆕 Новый сервер · {esc(server['name'])}",
+                                   hint="Установка VPN и пересоздание ключей. Это сообщение обновляется"))
+
+        async def job():
+            try:
+                ok, errors = await services.rebuild_server(bot, db, fleet, sid, live)
+                err = "".join(f"\n❌ {esc(x[:150])}" for x in errors[:10])
+                await live.done(f"✅ <b>Готово: ключей пересоздано {ok}</b>\nКлиенты и диллеры уже получили новые файлы.{err}",
+                                ikb([("🖥 К серверу", f"s:{sid}")], nav()))
+            except Exception as e:
+                await live.fail(f"Не удалось: {e}", getattr(e, "output", ""),
+                                ikb([("🔄 Повторить", f"rb:{sid}")], nav(f"s:{sid}")))
+            finally:
+                fleet.busy.discard(sid)
+        background(job())
 
     # ---------- перенос клиентов ----------
     @r.callback_query(F.data.startswith("st:"))
