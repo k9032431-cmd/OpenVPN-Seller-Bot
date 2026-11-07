@@ -2,9 +2,11 @@
 
 Роли:
   • главный админ (ADMIN_IDS) — серверы, скрипты, диллеры, рассылка и все ключи;
-  • диллер — только создание ключей и управление СВОИМИ ключами;
-  • клиент — получает ключ по ссылке-приглашению и пользуется своим меню.
-Скрипты — в scripts_ui.py.
+  • диллер — создаёт ключи и управляет только СВОИМИ ключами;
+  • клиент — получает ключ по ссылке-приглашению.
+
+Весь интерфейс — одна «панель» (см. ui.py): экраны меняются на месте, ответы пользователя удаляются.
+Роутеры подключаются в порядке: entry → scripts (scripts_ui.py) → admin → staff → client.
 """
 from __future__ import annotations
 
@@ -15,24 +17,21 @@ import re
 from typing import Optional
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandObject, CommandStart, Filter, StateFilter
+from aiogram.filters import CommandObject, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, Message
 
 from . import engine, services, texts
 from .config import Config
 from .db import DB
 from .engine import ERRORS, NAME_RE, Fleet, is_valid_host
 from .remote import RemoteError, bootstrap_ssh
-from .scripts_ui import scripts_list
-from .ui import Live, edit, ikb
+from .ui import (BTN_HOME, CANCEL, Live, fields, greet, ikb, nav, open_panel, pairs, screen, show)
 
 esc = html.escape
 PAGE_SIZE = 8
 SSH_TARGET_RE = re.compile(r"^(?:(?P<user>[a-z_][a-z0-9_-]*)@)?(?P<host>[^\s:@]+)(?::(?P<port>\d{1,5}))?$")
-CANCEL = [("❌ Отмена", "cancel")]
 _background: set[asyncio.Task] = set()
 
 
@@ -61,10 +60,22 @@ class ChangeIP(StatesGroup):
 
 class Broadcast(StatesGroup):
     text = State()
+    confirm = State()
 
 
 class AddDealer(StatesGroup):
     name = State()
+
+
+# ======================= роли =======================
+def role_of(cfg: Config, db: DB, uid: int) -> tuple[str, object]:
+    """('admin'|'dealer'|'blocked'|'client', строка диллера или None)."""
+    if uid in cfg.admin_ids:
+        return "admin", None
+    d = db.dealer_by_tg(uid)
+    if d:
+        return ("dealer" if d["active"] else "blocked"), d
+    return "client", None
 
 
 class Staff(Filter):
@@ -74,52 +85,71 @@ class Staff(Filter):
         self.cfg = cfg
 
     async def __call__(self, event, db: DB) -> bool | dict:
-        uid = event.from_user.id
-        if uid in self.cfg.admin_ids:
-            return {"role": "admin", "dealer": None}
-        d = db.dealer_by_tg(uid)
-        if d and d["active"]:
-            return {"role": "dealer", "dealer": d}
-        return False
+        role, dealer = role_of(self.cfg, db, event.from_user.id)
+        return {"role": role, "dealer": dealer} if role in ("admin", "dealer") else False
 
 
-# ======================= клавиатуры =======================
-def user_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
-        [KeyboardButton(text=texts.BTN_KEY), KeyboardButton(text=texts.BTN_SUB)],
-        [KeyboardButton(text=texts.BTN_HOWTO), KeyboardButton(text=texts.BTN_SUPPORT)],
-    ])
-
-
-def admin_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
-        [KeyboardButton(text=texts.BTN_NEW), KeyboardButton(text=texts.BTN_KEYS)],
-        [KeyboardButton(text=texts.BTN_SERVERS), KeyboardButton(text=texts.BTN_SCRIPTS)],
-        [KeyboardButton(text=texts.BTN_DEALERS), KeyboardButton(text=texts.BTN_BCAST)],
-        [KeyboardButton(text=texts.BTN_HELP)],
-    ])
-
-
-def dealer_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
-        [KeyboardButton(text=texts.BTN_NEW), KeyboardButton(text=texts.BTN_KEYS)],
-        [KeyboardButton(text=texts.BTN_HELP)],
-    ])
-
-
-def staff_keyboard(role: str) -> ReplyKeyboardMarkup:
-    return admin_keyboard() if role == "admin" else dealer_keyboard()
+def name_of(row) -> str:
+    return esc(row["name"]) if row else "—"
 
 
 def invite_link(bot_username: str, token: str) -> str:
     return f"https://t.me/{bot_username}?start={token}"
 
 
-def name_of(row) -> str:
-    return row["name"] if row else "?"
+def short_date(ts) -> str:
+    return services.fmt_date(ts)[:10] if ts else "♾"
 
 
-# ======================= ключи: тексты =======================
+def key_status(c) -> str:
+    return "🟢 Активен" if c["status"] == "active" else "🔴 Отключён"
+
+
+# ======================= главные экраны =======================
+def home_screen(cfg: Config, db: DB, uid: int):
+    role, dealer = role_of(cfg, db, uid)
+    if role == "admin":
+        servers, scripts = db.servers(), db.scripts(only_enabled=True)
+        active = len(db.active())
+        dealers = db.dealers()
+        blocks = [fields(("🖥 Серверов", len(servers)), ("🔑 Активных ключей", active),
+                         ("👥 Диллеров", len(dealers)))]
+        if not scripts or not servers or not db.list_all():
+            def mark(done):
+                return "✅" if done else "▫️"
+            blocks.append("<b>🚀 Быстрый старт</b>\n"
+                          f"{mark(scripts)} 1. Добавить скрипт VPN — «📜 Скрипты»\n"
+                          f"{mark(servers)} 2. Добавить сервер — «🖥 Серверы»\n"
+                          f"{mark(db.list_all())} 3. Создать первый ключ — «➕ Новый ключ»")
+        kb = ikb([(texts.BTN_NEW, "new")],
+                 [(texts.BTN_KEYS, "kp:0:a"), (texts.BTN_SERVERS, "sl")],
+                 [(texts.BTN_SCRIPTS, "sc:list"), (texts.BTN_DEALERS, "dls")],
+                 [(texts.BTN_BCAST, "bc"), (texts.BTN_HELP, "help")])
+        return screen("🏠 Главное меню", *blocks, hint="Выберите раздел"), kb
+    if role == "dealer":
+        active, total = db.dealer_counts(dealer["id"])
+        kb = ikb([(texts.BTN_NEW, "new")],
+                 [(texts.BTN_MY_KEYS, f"kp:0:d{dealer['id']}"), (texts.BTN_HELP, "help")])
+        return screen("🏠 Главное меню",
+                      fields(("👤 Диллер", esc(dealer["name"])), ("🔑 Активных ключей", active),
+                             ("📦 Всего ключей", total)),
+                      hint="Выберите раздел"), kb
+    if role == "blocked":
+        return texts.DEALER_BLOCKED, None
+    return client_home(db, uid)
+
+
+def client_home(db: DB, uid: int):
+    keys = db.clients_of(uid)
+    if not keys:
+        return screen("🔐 Мой VPN", texts.CLIENT_NO_KEYS), ikb([(texts.BTN_HOWTO, "c:howto"),
+                                                                (texts.BTN_SUPPORT, "c:support")])
+    lines = "\n".join(f"🔑 <b>{c['name']}</b> · {services.fmt_until(c['expires_at'])}" for c in keys)
+    kb = ikb([(texts.BTN_GET_KEY, "c:key")], [(texts.BTN_HOWTO, "c:howto"), (texts.BTN_SUPPORT, "c:support")])
+    return screen("🔐 Мой VPN", lines, hint="Если IP сервера изменится — бот сам пришлёт новый ключ"), kb
+
+
+# ======================= ключи =======================
 # scope в кнопках: "a" — все ключи (только админ), "d<id>" — ключи одного диллера
 def resolve_scope(role: str, dealer, requested: str = "a") -> tuple[str, Optional[int]]:
     if role == "dealer":                       # диллер всегда видит только свои ключи
@@ -133,302 +163,348 @@ def can_manage(role: str, dealer, c) -> bool:
     return c is not None and (role == "admin" or c["dealer_id"] == dealer["id"])
 
 
-def key_card(db: DB, c, bot_username: str, scope: str, admin_view: bool):
-    who = "ещё не открыл ссылку"
-    if c["tg_id"]:
-        who = f"<code>{c['tg_id']}</code>" + (f" @{esc(c['tg_username'])}" if c["tg_username"] else "")
-    lines = [
-        f"🔑 <b>{c['name']}</b> — {'🟢 активен' if c['status'] == 'active' else '🔴 отключён'}",
-        f"Сервер: {esc(name_of(db.server(c['server_id'])))} · {esc(name_of(db.script(c['script_id'])))}",
-    ]
-    if admin_view:
-        lines.append(f"Диллер: {esc(name_of(db.dealer(c['dealer_id'])))}" if c["dealer_id"] else "Диллер: — (ваш ключ)")
-    lines += [f"Клиент: {who}", f"Срок: {services.fmt_until(c['expires_at'])}",
-              f"Создан: {services.fmt_date(c['created_at'])}"]
-    if c["note"]:
-        lines.append(f"Заметка: {esc(c['note'])}")
-    if c["status"] == "active" and not c["tg_id"]:
-        lines.append(f"\n🔗 Ссылка для клиента:\n{invite_link(bot_username, c['invite_token'])}")
-    i = c["id"]
-    back = [("⬅️ К списку", f"kp:0:{scope}")]
-    if c["status"] != "active":
-        return "\n".join(lines), ikb(back)
-    return "\n".join(lines), ikb(
-        [("📄 Получить ключ", f"kf:{i}"), ("🔗 Новая ссылка", f"kl:{i}:{scope}")],
-        [("+30 дней", f"ke:{i}:30:{scope}"), ("+90 дней", f"ke:{i}:90:{scope}"), ("♾", f"ke:{i}:0:{scope}")],
-        [("⛔ Отключить", f"kr:{i}:{scope}")],
-        back)
-
-
-def keys_list(db: DB, page: int, scope: str, dealer_id: Optional[int], admin_view: bool):
+def keys_screen(db: DB, page: int, scope: str, dealer_id: Optional[int], admin_view: bool):
     rows = db.list_all(dealer_id)
     servers = db.servers()
-    names = {s["id"]: s["name"][:10] for s in servers}
-    dealer_names = {d["id"]: d["name"][:8] for d in db.dealers()} if admin_view and dealer_id is None else {}
+    srv = {s["id"]: s["name"][:10] for s in servers}
+    dlr = {d["id"]: d["name"][:8] for d in db.dealers()} if admin_view and dealer_id is None else {}
     pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
     page = min(max(page, 0), pages - 1)
     buttons = []
     for c in rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
         icon = ("🟢" if c["status"] == "active" else "🔴") + ("👤" if c["tg_id"] else "🔗")
-        until = "♾" if not c["expires_at"] else services.fmt_date(c["expires_at"])[:10]
-        where = f" · {names.get(c['server_id'], '?')}" if len(servers) > 1 else ""
-        who = f" · 👥{dealer_names[c['dealer_id']]}" if c["dealer_id"] in dealer_names else ""
-        buttons.append([(f"{icon} {c['name']}{where}{who} · {until}", f"k:{c['id']}:{scope}")])
+        where = f" · {srv.get(c['server_id'], '?')}" if len(servers) > 1 else ""
+        who = f" · 👥{dlr[c['dealer_id']]}" if c["dealer_id"] in dlr else ""
+        buttons.append([(f"{icon} {c['name']}{where}{who} · {short_date(c['expires_at'])}", f"k:{c['id']}:{scope}")])
     if pages > 1:
-        buttons.append([("◀️", f"kp:{page - 1}:{scope}"), (f"{page + 1}/{pages}", "noop"),
+        buttons.append([("◀️", f"kp:{page - 1}:{scope}"), (f"{page + 1} / {pages}", "noop"),
                         ("▶️", f"kp:{page + 1}:{scope}")])
-    if not admin_view or dealer_id is None:
-        buttons.append([(texts.BTN_NEW, "new")])
     if admin_view and dealer_id is not None:
-        buttons.append([("⬅️ К диллеру", f"dl:{dealer_id}")])
+        title = f"📋 Ключи диллера {name_of(db.dealer(dealer_id))}"
+        buttons.append(nav(f"dl:{dealer_id}"))
+    else:
+        title = "📋 Все ключи" if admin_view else "📋 Мои ключи"
+        buttons.append([(texts.BTN_NEW, "new")])
+        buttons.append(nav())
+    if not rows:
+        return screen(title, "Ключей пока нет.", hint="Создайте первый: «➕ Новый ключ»"), ikb(*buttons)
     active = sum(1 for c in rows if c["status"] == "active")
-    if not admin_view:
-        title = "📋 <b>Ваши ключи</b>"
-    elif dealer_id is not None:
-        title = f"📋 <b>Ключи диллера «{esc(name_of(db.dealer(dealer_id)))}»</b>"
-    else:
-        title = "📋 <b>Все ключи</b>"
-    text = (f"{title}: {len(rows)}, активных: {active}\nНажмите на ключ, чтобы управлять им.\n"
-            "🟢 активен · 🔴 отключён · 👤 у клиента · 🔗 ссылку не открыли") if rows else \
-        f"{title}\n\nКлючей пока нет. Нажмите «➕ Новый ключ»."
-    return text, ikb(*buttons)
+    return screen(title, fields(("Всего", len(rows)), ("Активных", active)),
+                  hint="🟢 активен · 🔴 отключён · 👤 у клиента · 🔗 ссылку ещё не открыли"), ikb(*buttons)
 
 
-# ======================= диллеры: тексты =======================
-def dealers_list(db: DB):
-    rows = []
-    for d in db.dealers():
-        active, _ = db.dealer_counts(d["id"])
-        icon = "⏸" if not d["active"] else ("👤" if d["tg_id"] else "🔗")
-        rows.append([(f"{icon} {d['name']} · 🔑{active}", f"dl:{d['id']}")])
-    rows.append([("➕ Добавить диллера", "dla")])
-    text = ("👥 <b>Диллеры</b>\nДиллеры создают ключи для своих клиентов и видят только свои ключи.\n"
-            "👤 подключён · 🔗 ещё не открыл ссылку · ⏸ заблокирован" if len(rows) > 1 else
-            "👥 <b>Диллеров пока нет</b>\n\nНажмите «➕ Добавить диллера» — бот даст ссылку, "
-            "диллер откроет её и сможет создавать ключи.")
-    return text, ikb(*rows)
+def key_screen(db: DB, c, bot_username: str, scope: str, admin_view: bool, top: str = ""):
+    client = "<i>ещё не открыл ссылку</i>"
+    if c["tg_id"]:
+        client = f"@{esc(c['tg_username'])}" if c["tg_username"] else f"ID {c['tg_id']}"
+    info = fields(
+        ("Статус", key_status(c)),
+        ("Сервер", name_of(db.server(c["server_id"]))),
+        ("VPN", name_of(db.script(c["script_id"]))),
+        ("Диллер", (name_of(db.dealer(c["dealer_id"])) if c["dealer_id"] else "— (ваш)") if admin_view else None),
+        ("Срок", services.fmt_until(c["expires_at"])),
+        ("Создан", services.fmt_date(c["created_at"])[:10]),
+        ("Заметка", esc(c["note"]) if c["note"] else None),
+    ) + f"\nКлиент: <b>{client}</b>"
+    link = None
+    if c["status"] == "active" and not c["tg_id"]:
+        link = f"<b>🔗 Ссылка для клиента</b>\n{invite_link(bot_username, c['invite_token'])}"
+    i = c["id"]
+    back = nav(f"kp:0:{scope}")
+    if c["status"] != "active":
+        return screen(f"🔑 {c['name']}", top, info), ikb(back)
+    kb = ikb([("📄 Файл ключа", f"kf:{i}"), ("🔗 Новая ссылка", f"kl:{i}:{scope}")],
+             [("+30 дней", f"ke:{i}:30:{scope}"), ("+90 дней", f"ke:{i}:90:{scope}"), ("♾ Бессрочно", f"ke:{i}:0:{scope}")],
+             [("⛔ Отключить ключ", f"kr:{i}:{scope}")],
+             back)
+    hint = "Перешлите ссылку клиенту — он нажмёт «Запустить» и получит ключ" if link else ""
+    return screen(f"🔑 {c['name']}", top, info, link, hint=hint), kb
 
 
-def dealer_card(db: DB, did: int, bot_username: str):
-    d = db.dealer(did)
-    if d is None:
-        return "Диллер не найден.", ikb([("⬅️ К диллерам", "dls")])
-    active, total = db.dealer_counts(did)
-    if d["tg_id"]:
-        who = f"<code>{d['tg_id']}</code>" + (f" @{esc(d['tg_username'])}" if d["tg_username"] else "")
-    else:
-        who = "ещё не открыл ссылку"
-    lines = [f"👥 <b>{esc(d['name'])}</b> — {'🟢 активен' if d['active'] else '⏸ заблокирован'}",
-             f"Telegram: {who}", f"Ключей: активных <b>{active}</b>, всего {total}",
-             f"Добавлен: {services.fmt_date(d['created_at'])}"]
-    if not d["tg_id"]:
-        lines.append(f"\n🔗 Ссылка для диллера (перешлите ему):\n{invite_link(bot_username, d['invite_token'])}")
-    return "\n".join(lines), ikb(
-        [("📋 Ключи диллера", f"kp:0:d{did}")],
-        [("⏸ Заблокировать", f"dlb:{did}") if d["active"] else ("▶️ Разблокировать", f"dlb:{did}"),
-         ("🔗 Новая ссылка", f"dll:{did}")],
-        [("🗑 Удалить", f"dld:{did}")],
-        [("⬅️ К диллерам", "dls")])
-
-
-# ======================= серверы: тексты =======================
-def servers_list(db: DB):
+# ======================= серверы =======================
+def servers_screen(db: DB, top: str = ""):
     servers = db.servers()
-    rows = [[(f"🖥 {s['name']} · {s['host']} · 🔑{db.count_active(s['id'])}", f"s:{s['id']}")] for s in servers]
-    rows.append([("➕ Добавить сервер", "sa")])
-    text = ("🖥 <b>Ваши серверы</b>\nНажмите на сервер, чтобы управлять им." if servers else
-            "🖥 <b>Серверов пока нет</b>\n\nНажмите «➕ Добавить сервер». Понадобится только IP и пароль root.")
-    return text, ikb(*rows)
+    rows = [[(f"🖥 {s['name']} · {s['host']} · 🔑 {db.count_active(s['id'])}", f"s:{s['id']}")] for s in servers]
+    rows += [[("➕ Добавить сервер", "sa")], nav()]
+    if not servers:
+        return screen("🖥 Серверы", top, "Серверов пока нет.",
+                      hint="Нажмите «➕ Добавить сервер» — понадобятся только IP и пароль root"), ikb(*rows)
+    return screen("🖥 Серверы", top, fields(("Всего", len(servers))), hint="Нажмите на сервер, чтобы управлять им"), ikb(*rows)
 
 
-async def server_card(db: DB, fleet: Fleet, sid: int):
+async def server_screen(db: DB, fleet: Fleet, sid: int, top: str = ""):
     s = db.server(sid)
     if s is None:
-        return "Сервер не найден.", ikb([("⬅️ К серверам", "sl")])
+        return screen("🖥 Сервер не найден"), ikb(nav("sl"))
     error = ""
     try:
         await fleet.remote(s).ping()
     except RemoteError as e:
         error = str(e)
     busy = sid in fleet.busy
-    count = db.count_active(sid)
-    lines = [f"🖥 <b>{esc(s['name'])}</b>", f"SSH: <code>{s['user']}@{s['host']}:{s['port']}</code>",
-             "⏳ Сейчас идёт установка или перенос…" if busy else
-             (f"⚠️ Нет связи: {esc(error)}" if error else "✅ На связи"), "", "<b>Скрипты:</b>"]
-    rows = []
-    scripts = db.scripts(only_enabled=True)
-    for sc in scripts:
+    status = "⏳ Идёт установка или перенос" if busy else ("⚠️ Нет связи" if error else "✅ На связи")
+    info = fields(("Статус", status), ("IP", s["host"]), ("SSH", f"{s['user']}@{s['host']}:{s['port']}"),
+                  ("Активных ключей", db.count_active(sid)))
+    if error:
+        info += f"\n<i>{esc(error)}</i>"
+    rows: list = []
+    vpn_lines = []
+    for sc in db.scripts(only_enabled=True):
         ver = db.installed_version(sid, sc["id"])
         if ver == sc["version"]:
-            lines.append(f"✅ {esc(sc['name'])} — установлен")
+            vpn_lines.append(f"✅ {esc(sc['name'])} — установлен")
         elif ver is None:
-            lines.append(f"➖ {esc(sc['name'])} — не установлен (поставится сам при первом ключе)")
+            vpn_lines.append(f"▫️ {esc(sc['name'])} — не установлен")
             rows.append([(f"⚙️ Установить {sc['name']}", f"si:{sid}:{sc['id']}")])
         else:
-            lines.append(f"🔄 {esc(sc['name'])} — скрипт изменился, переустановится при следующем ключе")
+            vpn_lines.append(f"🔄 {esc(sc['name'])} — скрипт изменился")
             rows.append([(f"🔄 Переустановить {sc['name']}", f"si:{sid}:{sc['id']}")])
-    if not scripts:
-        lines.append("Пока нет — добавьте в «📜 Скрипты».")
-    lines.append(f"\nАктивных ключей: {count}")
+    vpn = "<b>VPN на сервере</b>\n" + ("\n".join(vpn_lines) or "<i>скриптов нет — добавьте в «📜 Скрипты»</i>")
     if busy:
         rows = []
     else:
         rows.append([("✏️ Сменить IP", f"sc_ip:{sid}"), ("🔄 Разослать ключи", f"sp:{sid}")])
-        if count and len(db.servers()) > 1:
-            rows.append([("🔁 Перенести клиентов на другой сервер", f"st:{sid}")])
+        if db.count_active(sid) and len(db.servers()) > 1:
+            rows.append([("🔁 Перенести клиентов", f"st:{sid}")])
     rows.append([("♻️ Обновить", f"s:{sid}"), ("🗑 Удалить", f"sd:{sid}")])
-    rows.append([("⬅️ К серверам", "sl")])
-    return "\n".join(lines), ikb(*rows)
+    rows.append(nav("sl"))
+    hint = "Не установленный VPN поставится сам при первом ключе" if any("▫️" in l for l in vpn_lines) else ""
+    return screen(f"🖥 {esc(s['name'])}", top, info, vpn, hint=hint), ikb(*rows)
 
 
-# ======================= АДМИН =======================
+# ======================= диллеры =======================
+def dealers_screen(db: DB, top: str = ""):
+    rows = []
+    for d in db.dealers():
+        active, _ = db.dealer_counts(d["id"])
+        icon = "⏸" if not d["active"] else ("👤" if d["tg_id"] else "🔗")
+        rows.append([(f"{icon} {d['name']} · 🔑 {active}", f"dl:{d['id']}")])
+    count = len(rows)
+    rows += [[("➕ Добавить диллера", "dla")], nav()]
+    if not count:
+        return screen("👥 Диллеры", top, "Диллеров пока нет.",
+                      hint="Диллер создаёт ключи для своих клиентов и видит только свои ключи"), ikb(*rows)
+    return screen("👥 Диллеры", top, fields(("Всего", count)),
+                  hint="👤 подключён · 🔗 ещё не открыл ссылку · ⏸ заблокирован"), ikb(*rows)
+
+
+def dealer_screen(db: DB, did: int, bot_username: str, top: str = ""):
+    d = db.dealer(did)
+    if d is None:
+        return screen("👥 Диллер не найден"), ikb(nav("dls"))
+    active, total = db.dealer_counts(did)
+    tg = (f"@{esc(d['tg_username'])}" if d["tg_username"] else f"ID {d['tg_id']}") if d["tg_id"] else None
+    info = fields(("Статус", "🟢 Активен" if d["active"] else "⏸ Заблокирован"),
+                  ("Telegram", tg or "ещё не открыл ссылку"),
+                  ("Активных ключей", active), ("Всего ключей", total),
+                  ("Добавлен", services.fmt_date(d["created_at"])[:10]))
+    link = None if d["tg_id"] else f"<b>🔗 Ссылка для диллера</b>\n{invite_link(bot_username, d['invite_token'])}"
+    kb = ikb([("📋 Ключи диллера", f"kp:0:d{did}")],
+             [("⏸ Заблокировать", f"dlb:{did}") if d["active"] else ("▶️ Разблокировать", f"dlb:{did}"),
+              ("🔗 Новая ссылка", f"dll:{did}")],
+             [("🗑 Удалить диллера", f"dld:{did}")],
+             nav("dls"))
+    hint = "Перешлите ссылку диллеру — он нажмёт «Запустить» и сможет создавать ключи" if link else ""
+    return screen(f"👥 {esc(d['name'])}", top, info, link, hint=hint), kb
+
+
+# ======================= ВХОД: /start, «Главное меню», ссылки =======================
+def build_entry_router(cfg: Config) -> Router:
+    r = Router(name="entry")
+
+    @r.message(CommandStart())
+    async def cmd_start(m: Message, command: CommandObject, state: FSMContext, db: DB):
+        await state.clear()
+        uid = m.from_user.id
+        token = (command.args or "").strip()
+        top = ""
+        key_to_send = None
+        if token.startswith("dl_"):                          # ссылка диллера
+            d = db.dealer_by_token(token)
+            if not d or (d["tg_id"] and d["tg_id"] != uid):
+                top = f"⚠️ {texts.DEALER_INVITE_INVALID}"
+            else:
+                db.bind_dealer(d["id"], uid, m.from_user.username)
+                top = texts.DEALER_JOINED.format(name=esc(d["name"]))
+                who = f" · @{esc(m.from_user.username)}" if m.from_user.username else ""
+                await services.notify_admins(m.bot, cfg, f"👥 <b>Диллер {esc(d['name'])} подключился</b>{who}")
+        elif token:                                          # ссылка клиента
+            c = db.get_by_token(token)
+            if not c:
+                top = f"⚠️ {texts.INVITE_INVALID}"
+            elif c["status"] != "active":
+                top = f"⚠️ {texts.INVITE_REVOKED}"
+            elif c["tg_id"] and c["tg_id"] != uid:
+                top = f"⚠️ {texts.INVITE_TAKEN}"
+            else:
+                first_time = not c["tg_id"]
+                db.bind(c["id"], uid, m.from_user.username)
+                top = texts.CLIENT_BOUND.format(name=c["name"])
+                key_to_send = c
+                if first_time and c["dealer_id"]:
+                    who = f" · @{esc(m.from_user.username)}" if m.from_user.username else ""
+                    await services.tell_dealer(m.bot, db, c, texts.DEALER_CLIENT_BOUND.format(name=c["name"], who=who))
+        role, _ = role_of(cfg, db, uid)
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        await greet(m.bot, m.chat.id, {"admin": texts.GREET_ADMIN, "dealer": texts.GREET_DEALER}
+                    .get(role, texts.GREET_CLIENT))
+        text, kb = home_screen(cfg, db, uid)
+        await open_panel(m.bot, m.chat.id, f"{top}\n\n{text}" if top else text, kb)
+        if key_to_send is not None:                          # клиенту — файл ключа под меню
+            await services.send_key(m.bot, m.chat.id, key_to_send, texts.KEY_CAPTION)
+
+    @r.message(F.text == BTN_HOME)
+    @r.message(F.text.in_(texts.LEGACY_BUTTONS))
+    async def btn_home(m: Message, state: FSMContext, db: DB):
+        await state.clear()
+        legacy = m.text != BTN_HOME
+        text, kb = home_screen(cfg, db, m.from_user.id)
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        if legacy:  # заменить старую нижнюю клавиатуру на новую
+            role, _ = role_of(cfg, db, m.from_user.id)
+            await greet(m.bot, m.chat.id, {"admin": texts.GREET_ADMIN, "dealer": texts.GREET_DEALER}
+                        .get(role, texts.GREET_CLIENT))
+        await open_panel(m.bot, m.chat.id, text, kb)
+
+    @r.callback_query(F.data.in_({"home", "cancel"}))
+    async def cb_home(cb: CallbackQuery, state: FSMContext, db: DB):
+        await state.clear()
+        await cb.answer()
+        await show(cb, *home_screen(cfg, db, cb.from_user.id))
+
+    @r.callback_query(F.data == "noop")
+    async def cb_noop(cb: CallbackQuery):
+        await cb.answer()
+
+    return r
+
+
+# ======================= ГЛАВНЫЙ АДМИН =======================
 def build_admin_router(cfg: Config) -> Router:
     r = Router(name="admin")
     is_admin = F.from_user.id.in_(cfg.admin_ids)
     r.message.filter(is_admin)
     r.callback_query.filter(is_admin)
 
-    # ---------- главное меню (работает из любого шага) ----------
-    @r.message(F.text == texts.BTN_HELP)
-    @r.message(Command("help"))
-    async def menu_help(m: Message, state: FSMContext):
-        await state.clear()
-        await m.answer(texts.HOW_IT_WORKS.format(warn=cfg.warn_days), reply_markup=admin_keyboard())
-
-    @r.message(F.text == texts.BTN_DEALERS)
-    async def menu_dealers(m: Message, state: FSMContext, db: DB):
-        await state.clear()
-        text, kb = dealers_list(db)
-        await m.answer(text, reply_markup=kb)
-
-    @r.message(F.text == texts.BTN_SERVERS)
-    async def menu_servers(m: Message, state: FSMContext, db: DB):
-        await state.clear()
-        text, kb = servers_list(db)
-        await m.answer(text, reply_markup=kb)
-
-    @r.message(F.text == texts.BTN_SCRIPTS)
-    async def menu_scripts(m: Message, state: FSMContext, db: DB):
-        await state.clear()
-        text, kb = scripts_list(db)
-        await m.answer(text, reply_markup=kb)
-
-    @r.message(F.text == texts.BTN_BCAST)
-    async def menu_bcast(m: Message, state: FSMContext):
-        await state.set_state(Broadcast.text)
-        await m.answer("📢 Напишите сообщение — его получат все клиенты.", reply_markup=ikb(CANCEL))
-
-    @r.callback_query(F.data == "cancel")
-    async def cb_cancel(cb: CallbackQuery, state: FSMContext):
-        await state.clear()
-        await cb.answer()
-        await edit(cb, "Отменено.")
-
-    @r.callback_query(F.data == "noop")
-    async def cb_noop(cb: CallbackQuery):
-        await cb.answer()
-
     # ================= СЕРВЕРЫ =================
     @r.callback_query(F.data == "sl")
-    async def cb_servers(cb: CallbackQuery, db: DB):
+    async def cb_servers(cb: CallbackQuery, state: FSMContext, db: DB):
+        await state.clear()
         await cb.answer()
-        await edit(cb, *servers_list(db))
+        await show(cb, *servers_screen(db))
 
     @r.callback_query(F.data.regexp(r"^s:\d+$"))
-    async def cb_server(cb: CallbackQuery, db: DB, fleet: Fleet):
+    async def cb_server(cb: CallbackQuery, state: FSMContext, db: DB, fleet: Fleet):
+        await state.clear()
         await cb.answer("Проверяю сервер…")
-        await edit(cb, *await server_card(db, fleet, int(cb.data[2:])))
+        await show(cb, *await server_screen(db, fleet, int(cb.data[2:])))
 
     # ---------- добавить сервер ----------
+    def add_server_screen(step: int, question: str, data: dict, error: str = ""):
+        done = fields(("Название", esc(data["name"]) if data.get("name") else None),
+                      ("IP", f"{data['host']}:{data['port']}" if data.get("host") else None))
+        return screen(f"🖥 Новый сервер · шаг {step} из 3", done or None, question,
+                      f"⚠️ {error}" if error else None), ikb(CANCEL)
+
     @r.callback_query(F.data == "sa")
     async def cb_add(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         await state.set_state(AddServer.name)
-        await cb.message.answer("🖥 <b>Новый сервер</b>\n\nШаг 1 из 3. Как назвать сервер?\n"
-                                "Например: <code>Германия-1</code>", reply_markup=ikb(CANCEL))
+        await show(cb, *add_server_screen(1, "Как назвать сервер?\nНапример: <code>Германия-1</code>", {}))
 
     @r.message(AddServer.name, F.text)
     async def add_name(m: Message, state: FSMContext):
         await state.update_data(name=m.text.strip()[:40])
         await state.set_state(AddServer.host)
-        await m.answer("Шаг 2 из 3. Напишите <b>IP сервера</b>, например <code>1.2.3.4</code>\n"
-                       "Если SSH-порт не 22: <code>1.2.3.4:2222</code>", reply_markup=ikb(CANCEL))
+        await show(m, *add_server_screen(2, "Напишите <b>IP сервера</b>, например <code>1.2.3.4</code>\n"
+                                            "<i>Если SSH-порт не 22: 1.2.3.4:2222</i>", await state.get_data()))
 
     @r.message(AddServer.host, F.text)
     async def add_host(m: Message, state: FSMContext):
         match = SSH_TARGET_RE.match(m.text.strip())
+        data = await state.get_data()
         if not match or not is_valid_host(match["host"]) or int(match["port"] or 22) > 65535:
-            return await m.answer("❗ Не похоже на IP. Пример: <code>1.2.3.4</code>", reply_markup=ikb(CANCEL))
+            return await show(m, *add_server_screen(2, "Напишите <b>IP сервера</b>, например <code>1.2.3.4</code>",
+                                                    data, "Это не похоже на IP-адрес"))
         user = match["user"] or "root"
         await state.update_data(host=match["host"], port=int(match["port"] or 22), user=user)
         await state.set_state(AddServer.password)
-        await m.answer(f"Шаг 3 из 3. Напишите <b>пароль {user}</b> от сервера.\n\n"
-                       "🔒 Бот зайдёт один раз, добавит свой ключ и удалит ваше сообщение с паролем. "
-                       "Пароль нигде не сохраняется.", reply_markup=ikb(CANCEL))
+        await show(m, *add_server_screen(3, f"Напишите <b>пароль {user}</b> от сервера.\n"
+                                            "<i>🔒 Бот зайдёт один раз, добавит свой ключ и сразу удалит сообщение "
+                                            "с паролем. Пароль нигде не сохраняется.</i>", await state.get_data()))
 
     @r.message(AddServer.password, F.text)
     async def add_password(m: Message, state: FSMContext, db: DB, fleet: Fleet):
         password = m.text
-        try:
-            await m.delete()
-        except TelegramBadRequest:
-            pass
         data = await state.get_data()
-        status = await m.answer(f"⏳ Подключаюсь к {data['host']}…")
+        panel = await show(m, *add_server_screen(3, f"⏳ Подключаюсь к <b>{data['host']}</b>…", data))
         try:
             host_key = await bootstrap_ssh(data["host"], data["port"], data["user"], password, fleet.pubkey)
         except RemoteError as e:
-            return await status.edit_text(f"❌ {esc(str(e))}\n\nНапишите пароль ещё раз:", reply_markup=ikb(CANCEL))
+            text, kb = add_server_screen(3, f"Напишите <b>пароль {data['user']}</b> ещё раз.", data, str(e))
+            return await panel.edit_text(text, reply_markup=kb)
         await state.clear()
         sid = db.add_server(data["name"], "ssh", data["host"], data["port"], data["user"], host_key)
-        text, kb = await server_card(db, fleet, sid)
-        await status.edit_text(f"✅ Сервер добавлен!\n\n{text}", reply_markup=kb)
+        text, kb = await server_screen(db, fleet, sid, top="✅ Сервер добавлен")
+        await panel.edit_text(text, reply_markup=kb)
 
     # ---------- установка скрипта ----------
     @r.callback_query(F.data.startswith("si:"))
-    async def cb_install(cb: CallbackQuery, db: DB, fleet: Fleet):
+    async def cb_install(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
         _, sid, scid = cb.data.split(":")
         server, script = db.server(int(sid)), db.script(int(scid))
         if server["id"] in fleet.busy:
             return await cb.answer("На сервере уже идёт операция", show_alert=True)
-        await cb.answer()
-        live = Live(cb.message, f"⚙️ <b>Установка {esc(script['name'])}</b> · 🖥 {esc(server['name'])}\n"
-                                "Обычно 5–30 минут (на слабом сервере генерация ключей шифрования идёт долго).\nМожно пользоваться ботом — я обновляю это сообщение.\n\n")
+        await cb.answer("Установка запущена")
+        fleet.busy.add(server["id"])
+        await show(cb, *await server_screen(db, fleet, server["id"]))
+        # прогресс — отдельным сообщением, чтобы меню оставалось свободным
+        status = await bot.send_message(cb.message.chat.id, "⏳")
+        live = Live(status, screen(f"⚙️ Установка {esc(script['name'])} · {esc(server['name'])}",
+                                   hint="Обычно 5–30 минут. Можно пользоваться ботом — это сообщение обновляется"))
 
         async def job():
-            fleet.busy.add(server["id"])
             try:
-                remote = fleet.remote(server)
-                async with remote.busy:
+                async with fleet.remote(server).busy:
                     await engine.install(fleet, db, server, script, live, force=True)
-                await live.done(f"🎉 <b>{esc(script['name'])} установлен!</b> Теперь можно создавать ключи: "
-                                "«➕ Новый ключ».", ikb([("🖥 К серверу", f"s:{server['id']}")]))
+                await live.done(f"🎉 <b>{esc(script['name'])} установлен</b>\nТеперь можно создавать ключи.",
+                                ikb([(texts.BTN_NEW, "new"), ("🖥 К серверу", f"s:{server['id']}")]))
             except ERRORS as e:
                 await live.fail(str(e), getattr(e, "output", ""),
-                                ikb([("🔄 Попробовать снова", cb.data)], [("🖥 К серверу", f"s:{server['id']}")]))
+                                ikb([("🔄 Повторить", cb.data), ("🖥 К серверу", f"s:{server['id']}")]))
             finally:
                 fleet.busy.discard(server["id"])
         background(job())
 
-    # ---------- рассылка ключей ----------
+    # ---------- рассылка ключей сервера ----------
     @r.callback_query(F.data.startswith("sp:"))
-    async def cb_push(cb: CallbackQuery, db: DB, bot: Bot):
+    async def cb_push(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
+        sid = int(cb.data[3:])
         await cb.answer("Рассылаю…")
-        ok, fail = await services.push_configs(bot, db, int(cb.data[3:]), texts.PUSH_CAPTION)
-        await cb.message.answer(f"✅ Ключи разосланы: {ok}, не доставлено: {fail}.")
+        ok, fail = await services.push_configs(bot, db, sid, texts.PUSH_CAPTION)
+        await show(cb, *await server_screen(db, fleet, sid, top=f"✅ Ключи разосланы: {ok} · не доставлено: {fail}"))
 
     # ---------- смена IP ----------
+    def ip_screen(server, error: str = ""):
+        return screen(f"✏️ Смена IP · {esc(server['name'])}", fields(("Сейчас", server["host"])),
+                      "Напишите <b>новый IP</b> сервера. Пароль не нужен.",
+                      f"⚠️ {error}" if error else None,
+                      hint="Бот подключится по новому IP, обновит ключи и сам разошлёт их клиентам и диллерам"), \
+            ikb(nav(f"s:{server['id']}"))
+
     @r.callback_query(F.data.startswith("sc_ip:"))
     async def cb_change_ip(cb: CallbackQuery, state: FSMContext, db: DB):
         sid = int(cb.data.split(":")[1])
         await cb.answer()
         await state.set_state(ChangeIP.host)
         await state.update_data(sid=sid)
-        await cb.message.answer(
-            f"🌐 <b>Смена IP</b> · {esc(name_of(db.server(sid)))}\nСейчас: <code>{db.server(sid)['host']}</code>\n\n"
-            "Напишите <b>новый IP</b>. Пароль вводить не нужно.\n\n"
-            "Бот подключится по новому IP, выполнит шаги «Смена IP» скрипта, заменит IP во всех ключах "
-            "и <b>сам разошлёт их клиентам</b>.", reply_markup=ikb(CANCEL))
+        await show(cb, *ip_screen(db.server(sid)))
 
     @r.message(ChangeIP.host, F.text)
     async def change_ip_text(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot):
@@ -436,40 +512,44 @@ def build_admin_router(cfg: Config) -> Router:
         sid = (await state.get_data())["sid"]
         server = db.server(sid)
         if not is_valid_host(host):
-            return await m.answer("❗ Это не похоже на IP. Пример: <code>1.2.3.4</code>", reply_markup=ikb(CANCEL))
+            return await show(m, *ip_screen(server, "Это не похоже на IP-адрес"))
         if host == server["host"]:
-            return await m.answer("❗ Это текущий IP сервера. Напишите новый:", reply_markup=ikb(CANCEL))
+            return await show(m, *ip_screen(server, "Это текущий IP сервера"))
         await state.clear()
-        status = await m.answer("⏳")
-        live = Live(status, f"🌐 <b>Смена IP</b> · {esc(server['name'])}\n"
-                            f"<code>{server['host']}</code> → <code>{esc(host)}</code>\n\n")
+        header = screen(f"🌐 Смена IP · {esc(server['name'])}", f"<code>{server['host']}</code> → <code>{esc(host)}</code>")
+        panel = await show(m, header)
+        live = Live(panel, header)
         await live(f"⏳ Подключаюсь к {host}…")
         try:
             updated, ok, fail, warnings = await services.change_address(bot, db, fleet, sid, host, live)
         except ERRORS as e:
-            return await live.fail(f"{e}\n\nIP не изменён. Проверьте адрес. Если это другой (новый) сервер — "
-                                   "добавьте его и перенесите клиентов.", getattr(e, "output", ""))
+            return await live.fail(f"{e}\nIP не изменён. Если это другой (новый) сервер — добавьте его "
+                                   "и перенесите клиентов.", getattr(e, "output", ""), ikb(nav(f"s:{sid}")))
         warn = "".join(f"\n⚠️ {esc(w)}" for w in warnings)
-        await live.done(f"✅ <b>Готово.</b> Ключей обновлено: {updated}. Клиентам отправлено: {ok}, "
-                        f"не доставлено: {fail}.{warn}", ikb([("🖥 К серверу", f"s:{sid}")]))
+        await live.done("✅ <b>Готово</b>\n" + fields(("Обновлено ключей", updated), ("Отправлено клиентам", ok),
+                                                     ("Не доставлено", fail)) + warn,
+                        ikb([("🖥 К серверу", f"s:{sid}")], nav()))
 
     # ---------- перенос клиентов ----------
     @r.callback_query(F.data.startswith("st:"))
     async def cb_transfer_pick(cb: CallbackQuery, db: DB):
         src = int(cb.data[3:])
         await cb.answer()
-        await edit(cb, f"🔁 Куда перенести клиентов с «{esc(name_of(db.server(src)))}»?\n"
-                       "Каждый клиент получит новый ключ от выбранного сервера, сроки сохранятся.",
-                   ikb(*[[(f"🖥 {s['name']}", f"sT:{src}:{s['id']}")] for s in db.servers() if s["id"] != src],
-                       [("⬅️ Назад", f"s:{src}")]))
+        others = [(f"🖥 {s['name']}", f"sT:{src}:{s['id']}") for s in db.servers() if s["id"] != src]
+        await show(cb, screen(f"🔁 Перенос клиентов · {name_of(db.server(src))}",
+                              "Куда перенести клиентов?",
+                              hint="Каждый клиент получит новый ключ от выбранного сервера, сроки сохранятся"),
+                   ikb(*pairs(others), nav(f"s:{src}")))
 
     @r.callback_query(F.data.startswith("sT:"))
     async def cb_transfer_confirm(cb: CallbackQuery, db: DB):
         _, src, dst = cb.data.split(":")
         await cb.answer()
-        await edit(cb, f"Перенести {db.count_active(int(src))} клиентов\n"
-                       f"«{esc(name_of(db.server(int(src))))}» → «{esc(name_of(db.server(int(dst))))}»?",
-                   ikb([("✅ Да, перенести", f"sY:{src}:{dst}"), ("Нет", f"s:{src}")]))
+        await show(cb, screen("🔁 Перенос клиентов",
+                              fields(("Откуда", name_of(db.server(int(src)))), ("Куда", name_of(db.server(int(dst)))),
+                                     ("Клиентов", db.count_active(int(src)))),
+                              hint="Старые ключи будут отключены, если старый сервер доступен"),
+                   ikb([("✅ Перенести", f"sY:{src}:{dst}"), ("✖️ Отмена", f"s:{src}")]))
 
     @r.callback_query(F.data.startswith("sY:"))
     async def cb_transfer(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
@@ -477,15 +557,18 @@ def build_admin_router(cfg: Config) -> Router:
         src, dst = int(src), int(dst)
         if {src, dst} & fleet.busy:
             return await cb.answer("Сервер сейчас занят", show_alert=True)
-        await cb.answer()
-        live = Live(cb.message, f"🔁 <b>Перенос клиентов</b> → {esc(name_of(db.server(dst)))}\n\n")
+        await cb.answer("Перенос запущен")
+        fleet.busy.update({src, dst})
+        await show(cb, *await server_screen(db, fleet, src))
+        status = await bot.send_message(cb.message.chat.id, "⏳")
+        live = Live(status, screen(f"🔁 Перенос клиентов → {name_of(db.server(dst))}",
+                                   hint="Это сообщение обновляется"))
 
         async def job():
-            fleet.busy.update({src, dst})
             try:
                 ok, errors = await services.transfer_clients(bot, db, fleet, src, dst, live)
                 err = "".join(f"\n❌ {esc(x[:150])}" for x in errors[:10])
-                await live.done(f"✅ Перенесено: {ok}. Клиенты получили новые ключи.{err}",
+                await live.done(f"✅ <b>Перенесено клиентов: {ok}</b>\nОни уже получили новые ключи.{err}",
                                 ikb([("🖥 К серверу", f"s:{dst}")]))
             except Exception as e:
                 await live.fail(f"Перенос не удался: {e}")
@@ -493,53 +576,49 @@ def build_admin_router(cfg: Config) -> Router:
                 fleet.busy.difference_update({src, dst})
         background(job())
 
-    # ---------- удаление ----------
+    # ---------- удаление сервера ----------
     @r.callback_query(F.data.startswith("sd:"))
     async def cb_delete_ask(cb: CallbackQuery, db: DB):
         sid = int(cb.data[3:])
         await cb.answer()
         n = db.count_active(sid)
-        warn = f"\n{n} активных ключей будут отключены в боте, клиенты получат уведомление." if n else ""
-        await edit(cb, f"🗑 Удалить сервер «{esc(name_of(db.server(sid)))}» из бота?{warn}\n"
-                       "На самом сервере ничего не удаляется.",
-                   ikb([("Да, удалить", f"sD:{sid}"), ("Нет", f"s:{sid}")]))
+        await show(cb, screen(f"🗑 Удалить сервер {name_of(db.server(sid))}?",
+                              f"Активных ключей: <b>{n}</b> — они будут отключены в боте, клиенты получат уведомление."
+                              if n else None,
+                              hint="На самом сервере ничего не удаляется"),
+                   ikb([("🗑 Удалить", f"sD:{sid}"), ("✖️ Отмена", f"s:{sid}")]))
 
     @r.callback_query(F.data.startswith("sD:"))
     async def cb_delete(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot):
+        name = name_of(db.server(int(cb.data[3:])))
         await services.delete_server(bot, db, fleet, int(cb.data[3:]))
         await cb.answer("Сервер удалён")
-        await edit(cb, *servers_list(db))
+        await show(cb, *servers_screen(db, top=f"🗑 Сервер {name} удалён"))
 
     # ================= ДИЛЛЕРЫ =================
     @r.callback_query(F.data == "dls")
     async def cb_dealers(cb: CallbackQuery, state: FSMContext, db: DB):
         await state.clear()
         await cb.answer()
-        await edit(cb, *dealers_list(db))
+        await show(cb, *dealers_screen(db))
 
     @r.callback_query(F.data.regexp(r"^dl:\d+$"))
     async def cb_dealer(cb: CallbackQuery, db: DB, bot_username: str):
         await cb.answer()
-        await edit(cb, *dealer_card(db, int(cb.data[3:]), bot_username))
+        await show(cb, *dealer_screen(db, int(cb.data[3:]), bot_username))
 
     @r.callback_query(F.data == "dla")
     async def cb_dealer_add(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         await state.set_state(AddDealer.name)
-        await cb.message.answer("👥 <b>Новый диллер</b>\n\nКак его назвать? Например: <code>Мерген Ашхабад</code>",
-                                reply_markup=ikb(CANCEL))
+        await show(cb, screen("👥 Новый диллер", "Как его назвать?\nНапример: <code>Мерген Ашхабад</code>"),
+                   ikb(CANCEL))
 
     @r.message(AddDealer.name, F.text)
     async def dealer_add_name(m: Message, state: FSMContext, db: DB, bot_username: str):
         await state.clear()
         did = db.add_dealer(m.text.strip()[:40])
-        d = db.dealer(did)
-        await m.answer(f"✅ Диллер <b>{esc(d['name'])}</b> добавлен.\n\n"
-                       f"👉 <b>Перешлите ему эту ссылку:</b>\n{invite_link(bot_username, d['invite_token'])}\n\n"
-                       "Он откроет её, нажмёт «Запустить» — и сможет создавать ключи. "
-                       "Ссылка срабатывает один раз.", disable_web_page_preview=True, reply_markup=admin_keyboard())
-        text, kb = dealer_card(db, did, bot_username)
-        await m.answer(text, reply_markup=kb, disable_web_page_preview=True)
+        await show(m, *dealer_screen(db, did, bot_username, top="✅ Диллер добавлен"))
 
     @r.callback_query(F.data.startswith("dlb:"))
     async def cb_dealer_block(cb: CallbackQuery, db: DB, bot: Bot, bot_username: str):
@@ -548,28 +627,25 @@ def build_admin_router(cfg: Config) -> Router:
         db.set_dealer_active(did, not d["active"])
         await cb.answer("Заблокирован" if d["active"] else "Разблокирован")
         if d["tg_id"]:
-            if d["active"]:
-                await services.safe_send(bot, d["tg_id"], texts.DEALER_BLOCKED)
-            else:
-                await services.safe_send(bot, d["tg_id"], "✅ Доступ диллера восстановлен.",
-                                         reply_markup=dealer_keyboard())
-        await edit(cb, *dealer_card(db, did, bot_username))
+            await services.safe_send(bot, d["tg_id"], texts.DEALER_BLOCKED if d["active"] else texts.DEALER_UNBLOCKED)
+        await show(cb, *dealer_screen(db, did, bot_username))
 
     @r.callback_query(F.data.startswith("dll:"))
     async def cb_dealer_link(cb: CallbackQuery, db: DB, bot_username: str):
         did = int(cb.data[4:])
         db.reset_dealer_invite(did)
-        await cb.answer("Новая ссылка готова. Диллер отвязан, пока не откроет её.", show_alert=True)
-        await edit(cb, *dealer_card(db, did, bot_username))
+        await cb.answer("Готово")
+        await show(cb, *dealer_screen(db, did, bot_username,
+                                      top="🔗 Новая ссылка готова — диллер отвязан, пока не откроет её"))
 
     @r.callback_query(F.data.startswith("dld:"))
     async def cb_dealer_delete_ask(cb: CallbackQuery, db: DB):
         did = int(cb.data[4:])
         active, _ = db.dealer_counts(did)
         await cb.answer()
-        await edit(cb, f"🗑 Удалить диллера «{esc(name_of(db.dealer(did)))}»?\n"
-                       f"Его ключи ({active} активных) продолжат работать и перейдут вам.",
-                   ikb([("Да, удалить", f"dlD:{did}"), ("Нет", f"dl:{did}")]))
+        await show(cb, screen(f"🗑 Удалить диллера {name_of(db.dealer(did))}?",
+                              f"Его ключи (активных: <b>{active}</b>) продолжат работать и перейдут вам."),
+                   ikb([("🗑 Удалить", f"dlD:{did}"), ("✖️ Отмена", f"dl:{did}")]))
 
     @r.callback_query(F.data.startswith("dlD:"))
     async def cb_dealer_delete(cb: CallbackQuery, db: DB, bot: Bot):
@@ -577,27 +653,40 @@ def build_admin_router(cfg: Config) -> Router:
         d = db.dealer(did)
         db.delete_dealer(did)
         if d and d["tg_id"]:
-            await services.safe_send(bot, d["tg_id"], "⛔ Вы больше не диллер в этом боте.")
+            await services.safe_send(bot, d["tg_id"], texts.DEALER_REMOVED)
         await cb.answer("Диллер удалён")
-        await edit(cb, *dealers_list(db))
+        await show(cb, *dealers_screen(db, top=f"🗑 Диллер {name_of(d)} удалён"))
 
     # ================= РАССЫЛКА =================
+    @r.callback_query(F.data == "bc")
+    async def cb_bcast(cb: CallbackQuery, state: FSMContext, db: DB):
+        await cb.answer()
+        await state.set_state(Broadcast.text)
+        await show(cb, screen("📢 Рассылка", fields(("Получателей", len(db.user_ids()))),
+                              "Напишите сообщение — его получат все клиенты с активным ключом."), ikb(CANCEL))
+
     @r.message(Broadcast.text, F.text)
-    async def bcast_text(m: Message, state: FSMContext, db: DB, bot: Bot):
+    async def bcast_text(m: Message, state: FSMContext, db: DB):
+        await state.update_data(text=m.text)
+        await state.set_state(Broadcast.confirm)
+        await show(m, screen("📢 Рассылка · проверьте", f"📢 {esc(m.text)}",
+                             fields(("Получателей", len(db.user_ids())))),
+                   ikb([("✅ Отправить", "bc_go"), ("✏️ Изменить", "bc")], CANCEL))
+
+    @r.callback_query(Broadcast.confirm, F.data == "bc_go")
+    async def bcast_go(cb: CallbackQuery, state: FSMContext, db: DB, bot: Bot):
+        text = (await state.get_data())["text"]
         await state.clear()
+        await cb.answer("Отправляю…")
         ok = fail = 0
         for uid in db.user_ids():
-            if await services.safe_send(bot, uid, f"📢 {esc(m.text)}"):
+            if await services.safe_send(bot, uid, f"📢 {esc(text)}"):
                 ok += 1
             else:
                 fail += 1
             await asyncio.sleep(0.05)
-        await m.answer(f"📢 Доставлено: {ok}, не доставлено: {fail}.", reply_markup=admin_keyboard())
-
-    # любое другое сообщение админа (кроме /start и кнопок меню) — показать меню
-    @r.message(StateFilter(None), F.text, ~F.text.startswith("/"), ~F.text.in_(texts.MENU_BUTTONS))
-    async def admin_fallback(m: Message):
-        await m.answer(texts.ADMIN_WELCOME, reply_markup=admin_keyboard())
+        await show(cb, screen("📢 Рассылка отправлена", fields(("Доставлено", ok), ("Не доставлено", fail))),
+                   ikb(nav()))
 
     return r
 
@@ -609,149 +698,140 @@ def build_staff_router(cfg: Config) -> Router:
     r.message.filter(staff)
     r.callback_query.filter(staff)
 
-    @r.callback_query(F.data == "cancel")
-    async def cb_cancel(cb: CallbackQuery, state: FSMContext):
-        await state.clear()
+    @r.callback_query(F.data == "help")
+    async def cb_help(cb: CallbackQuery, role: str):
         await cb.answer()
-        await edit(cb, "Отменено.")
-
-    @r.callback_query(F.data == "noop")
-    async def cb_noop(cb: CallbackQuery):
-        await cb.answer()
-
-    @r.message(F.text == texts.BTN_HELP)
-    async def menu_help(m: Message, state: FSMContext, role: str):
-        await state.clear()
-        await m.answer(texts.DEALER_HELP, reply_markup=staff_keyboard(role))
-
-    @r.message(F.text == texts.BTN_KEYS)
-    async def menu_keys(m: Message, state: FSMContext, db: DB, role: str, dealer):
-        await state.clear()
-        scope, did = resolve_scope(role, dealer)
-        text, kb = keys_list(db, 0, scope, did, role == "admin")
-        await m.answer(text, reply_markup=kb)
+        text = texts.HELP_ADMIN.format(warn=cfg.warn_days) if role == "admin" else texts.HELP_DEALER
+        await show(cb, screen("❓ Помощь", text), ikb(nav()))
 
     # ---------- новый ключ ----------
-    @r.message(F.text == texts.BTN_NEW)
-    async def menu_new(m: Message, state: FSMContext, db: DB, role: str):
-        await state.clear()
-        servers, scripts = db.servers(), db.scripts(only_enabled=True)
-        if not scripts or not servers:
-            if role == "admin":
-                hint = ("Сначала добавьте скрипт: «📜 Скрипты» → «⚡ Готовый: OpenVPN»." if not scripts else
-                        "Сначала добавьте сервер: «🖥 Серверы» → «➕ Добавить сервер».")
-            else:
-                hint = "Пока нет доступных серверов. Обратитесь к администратору."
-            return await m.answer(hint, reply_markup=staff_keyboard(role))
-        if len(servers) == 1:
-            await state.update_data(sid=servers[0]["id"])
-            return await ask_script(m, state, db)
-        await state.set_state(NewKey.server)
-        await m.answer("🖥 На каком сервере создать ключ?",
-                       reply_markup=ikb(*[[(f"🖥 {s['name']}", f"ns:{s['id']}")] for s in servers], CANCEL))
+    def new_key_screen(db: DB, data: dict, question: str, error: str = "", kb_rows=()):
+        done = fields(("Сервер", name_of(db.server(data["sid"])) if data.get("sid") and len(db.servers()) > 1 else None),
+                      ("VPN", name_of(db.script(data["scid"])) if data.get("scid") and len(db.scripts(True)) > 1 else None),
+                      ("Ключ", data.get("name")))
+        return screen("➕ Новый ключ", done or None, question, f"⚠️ {error}" if error else None), ikb(*kb_rows, CANCEL)
 
-    async def ask_script(m: Message, state: FSMContext, db: DB):
-        scripts = db.scripts(only_enabled=True)
-        if len(scripts) == 1:
-            await state.update_data(scid=scripts[0]["id"])
-            return await ask_name(m, state)
-        await state.set_state(NewKey.script)
-        await m.answer("📜 Какой VPN?",
-                       reply_markup=ikb(*[[(f"📜 {s['name']}", f"nsc:{s['id']}")] for s in scripts], CANCEL))
-
-    async def ask_name(m: Message, state: FSMContext):
-        await state.set_state(NewKey.name)
-        await m.answer("✏️ Напишите <b>название ключа</b> латиницей, например <code>ahmet</code>\n"
-                       "Можно добавить заметку через пробел: <code>ahmet Ахмет +99361234567</code>",
-                       reply_markup=ikb(CANCEL))
+    NAME_Q = ("Напишите <b>имя ключа</b> латиницей, например <code>ahmet</code>\n"
+              "<i>Можно добавить заметку через пробел: ahmet Ахмет +99361234567</i>")
+    DAYS_Q = "На какой срок?\n<i>Нажмите кнопку или напишите число дней</i>"
+    DAYS_ROWS = ([("7 дней", "nd:7"), ("30 дней", "nd:30")], [("90 дней", "nd:90"), ("♾ Бессрочно", "nd:0")])
 
     @r.callback_query(F.data == "new")
     async def cb_new(cb: CallbackQuery, state: FSMContext, db: DB, role: str):
+        await state.clear()
         await cb.answer()
-        await menu_new(cb.message, state, db, role)
+        servers, scripts = db.servers(), db.scripts(only_enabled=True)
+        if not scripts or not servers:
+            if role == "admin":
+                hint = ("Сначала добавьте скрипт VPN: «📜 Скрипты» → «⚡ Готовый: OpenVPN»" if not scripts else
+                        "Сначала добавьте сервер: «🖥 Серверы» → «➕ Добавить сервер»")
+            else:
+                hint = "Пока нет доступных серверов. Обратитесь к администратору"
+            return await show(cb, screen("➕ Новый ключ", hint), ikb(nav()))
+        if len(servers) == 1:
+            await state.update_data(sid=servers[0]["id"])
+            return await ask_script(cb, state, db)
+        await state.set_state(NewKey.server)
+        await show(cb, *new_key_screen(db, {}, "На каком сервере создать ключ?",
+                                       kb_rows=pairs([(f"🖥 {s['name']}", f"ns:{s['id']}") for s in servers])))
+
+    async def ask_script(event, state: FSMContext, db: DB):
+        scripts = db.scripts(only_enabled=True)
+        if len(scripts) == 1:
+            await state.update_data(scid=scripts[0]["id"])
+            await state.set_state(NewKey.name)
+            return await show(event, *new_key_screen(db, await state.get_data(), NAME_Q))
+        await state.set_state(NewKey.script)
+        await show(event, *new_key_screen(db, await state.get_data(), "Какой VPN?",
+                                          kb_rows=pairs([(f"📜 {s['name']}", f"nsc:{s['id']}") for s in scripts])))
 
     @r.callback_query(NewKey.server, F.data.startswith("ns:"))
     async def new_server(cb: CallbackQuery, state: FSMContext, db: DB):
         await cb.answer()
         await state.update_data(sid=int(cb.data[3:]))
-        await edit(cb, f"🖥 Сервер: {esc(name_of(db.server(int(cb.data[3:]))))}")
-        await ask_script(cb.message, state, db)
+        await ask_script(cb, state, db)
 
     @r.callback_query(NewKey.script, F.data.startswith("nsc:"))
     async def new_script(cb: CallbackQuery, state: FSMContext, db: DB):
         await cb.answer()
         await state.update_data(scid=int(cb.data[4:]))
-        await edit(cb, f"📜 VPN: {esc(name_of(db.script(int(cb.data[4:]))))}")
-        await ask_name(cb.message, state)
+        await state.set_state(NewKey.name)
+        await show(cb, *new_key_screen(db, await state.get_data(), NAME_Q))
 
     @r.message(NewKey.name, F.text)
     async def new_name(m: Message, state: FSMContext, db: DB):
         parts = m.text.strip().split(maxsplit=1)
         name, note = parts[0], (parts[1] if len(parts) > 1 else None)
+        data = await state.get_data()
         if not NAME_RE.match(name):
-            return await m.answer("❗ Только латинские буквы, цифры, «_» и «-», без пробелов "
-                                  "(до 32 символов). Попробуйте ещё раз:", reply_markup=ikb(CANCEL))
-        old = db.get_by_name((await state.get_data())["sid"], name)
+            return await show(m, *new_key_screen(db, data, NAME_Q, "Только латинские буквы, цифры, «_» и «-», "
+                                                                   "без пробелов, до 32 символов"))
+        old = db.get_by_name(data["sid"], name)
         if old and old["status"] == "active":
-            return await m.answer(f"❗ Ключ <b>{name}</b> уже есть на этом сервере. Придумайте другое название:",
-                                  reply_markup=ikb(CANCEL))
+            return await show(m, *new_key_screen(db, data, NAME_Q, f"Ключ {name} уже есть — придумайте другое имя"))
         await state.update_data(name=name, note=note)
         await state.set_state(NewKey.days)
-        await m.answer(f"⏳ На какой срок ключ <b>{name}</b>?\nНажмите кнопку или напишите число дней.",
-                       reply_markup=ikb([("7 дней", "nd:7"), ("30 дней", "nd:30")],
-                                        [("90 дней", "nd:90"), ("♾ Бессрочно", "nd:0")], CANCEL))
+        await show(m, *new_key_screen(db, await state.get_data(), DAYS_Q, kb_rows=DAYS_ROWS))
 
-    async def create_key(m: Message, state: FSMContext, days: int, db: DB, fleet: Fleet,
+    async def create_key(event, state: FSMContext, days: int, db: DB, fleet: Fleet,
                          bot_username: str, role: str, dealer):
         data = await state.get_data()
         await state.clear()
         server, script, name = db.server(data["sid"]), db.script(data["scid"]), data["name"]
-        status = await m.answer("⏳")
-        live = Live(status, f"🔑 <b>Создание ключа</b> <code>{name}</code>\n"
-                            f"📜 {esc(script['name'])} · 🖥 {esc(server['name'])}\n\n")
+        header = screen(f"🔑 Создание ключа {name}", fields(("Сервер", name_of(server)), ("VPN", name_of(script))))
+        panel = await show(event, header)
+        live = Live(panel, header)
         await live("⏳ Подключение к серверу…")
         fleet.busy.add(server["id"])
         try:
             value, filename = await engine.create_key(fleet, db, server, script, name, live)
         except ERRORS as e:
-            return await live.fail(str(e), getattr(e, "output", "") if role == "admin" else "")
+            return await live.fail(str(e), getattr(e, "output", "") if role == "admin" else "",
+                                   ikb([("🔄 Попробовать снова", "new")], nav()))
         finally:
             fleet.busy.discard(server["id"])
         cid = db.add_client(server["id"], script["id"], name, value, filename, days, data.get("note"),
                             dealer_id=dealer["id"] if role == "dealer" else None)
         c = db.get(cid)
-        await status.edit_text(
-            f"✅ Ключ <b>{name}</b> создан · {services.fmt_until(c['expires_at'])}\n\n"
-            f"👉 <b>Перешлите клиенту эту ссылку:</b>\n{invite_link(bot_username, c['invite_token'])}\n\n"
-            "Клиент откроет её, нажмёт «Запустить» — и получит ключ.\n"
-            "Сам ключ ниже — если хотите отправить его сами.", disable_web_page_preview=True)
-        await services.send_key(m.bot, m.chat.id, c, texts.KEY_CAPTION)
+        scope, _ = resolve_scope(role, dealer)
+        text, kb = key_screen(db, c, bot_username, scope, role == "admin", top="✅ Ключ создан")
+        try:
+            await live.msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        except Exception:
+            live.msg = await open_panel(live.msg.bot, live.msg.chat.id, text, kb)
+        await services.send_key(live.msg.bot, live.msg.chat.id, c, texts.KEY_CAPTION)
 
     @r.callback_query(NewKey.days, F.data.startswith("nd:"))
     async def new_days_cb(cb: CallbackQuery, state: FSMContext, db: DB, fleet: Fleet, bot_username: str,
                           role: str, dealer):
         await cb.answer()
-        await edit(cb, f"Срок: {'бессрочно' if cb.data == 'nd:0' else cb.data[3:] + ' дней'}")
-        await create_key(cb.message, state, int(cb.data[3:]), db, fleet, bot_username, role, dealer)
+        await create_key(cb, state, int(cb.data[3:]), db, fleet, bot_username, role, dealer)
 
     @r.message(NewKey.days, F.text.regexp(r"^\d{1,4}$"))
     async def new_days_text(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot_username: str,
                             role: str, dealer):
         await create_key(m, state, int(m.text), db, fleet, bot_username, role, dealer)
 
+    @r.message(NewKey.days)
+    async def new_days_bad(m: Message, state: FSMContext, db: DB):
+        await show(m, *new_key_screen(db, await state.get_data(), DAYS_Q,
+                                      "Нажмите кнопку или напишите число дней (0 — бессрочно)", DAYS_ROWS))
+
     # ---------- список и карточка ключа ----------
     @r.callback_query(F.data.startswith("kp:"))
-    async def cb_page(cb: CallbackQuery, db: DB, role: str, dealer):
+    async def cb_page(cb: CallbackQuery, state: FSMContext, db: DB, role: str, dealer):
+        await state.clear()
         _, page, requested = (cb.data.split(":") + ["a"])[:3]
         scope, did = resolve_scope(role, dealer, requested)
         await cb.answer()
-        await edit(cb, *keys_list(db, int(page), scope, did, role == "admin"))
+        await show(cb, *keys_screen(db, int(page), scope, did, role == "admin"))
 
-    async def show_key(cb: CallbackQuery, db: DB, cid: int, scope: str, bot_username: str, role: str, dealer):
+    async def show_key(cb: CallbackQuery, db: DB, cid: int, scope: str, bot_username: str, role: str, dealer,
+                       top: str = ""):
         c = db.get(cid)
         if not can_manage(role, dealer, c):
-            return await edit(cb, "Ключ не найден.", ikb([("⬅️ К списку", f"kp:0:{scope}")]))
-        await edit(cb, *key_card(db, c, bot_username, scope, role == "admin"))
+            return await show(cb, screen("🔑 Ключ не найден"), ikb(nav(f"kp:0:{scope}")))
+        await show(cb, *key_screen(db, c, bot_username, scope, role == "admin", top))
 
     def parse(cb: CallbackQuery, role: str, dealer) -> tuple[int, list[str], str]:
         """kX:<id>[:<arg>…]:<scope> → (id, аргументы, scope)."""
@@ -771,7 +851,7 @@ def build_staff_router(cfg: Config) -> Router:
         c = db.get(int(cb.data.split(":")[1]))
         if not can_manage(role, dealer, c):
             return await cb.answer("Ключ не найден", show_alert=True)
-        await cb.answer()
+        await cb.answer("Отправляю файл")
         await services.send_key(bot, cb.message.chat.id, c, texts.KEY_CAPTION)
 
     @r.callback_query(F.data.startswith("kl:"))
@@ -780,8 +860,9 @@ def build_staff_router(cfg: Config) -> Router:
         if not can_manage(role, dealer, db.get(cid)):
             return await cb.answer("Ключ не найден", show_alert=True)
         db.reset_invite(cid)
-        await cb.answer("Новая ссылка готова. Старая больше не работает.", show_alert=True)
-        await show_key(cb, db, cid, scope, bot_username, role, dealer)
+        await cb.answer("Готово")
+        await show_key(cb, db, cid, scope, bot_username, role, dealer,
+                       top="🔗 Новая ссылка готова — старая больше не работает")
 
     @r.callback_query(F.data.startswith("ke:"))
     async def cb_extend(cb: CallbackQuery, db: DB, bot: Bot, bot_username: str, role: str, dealer):
@@ -790,12 +871,12 @@ def build_staff_router(cfg: Config) -> Router:
         if not can_manage(role, dealer, c) or c["status"] != "active":
             return await cb.answer("Ключ не активен", show_alert=True)
         until = services.fmt_until(db.extend(cid, int(args[0])))
-        await cb.answer(f"Продлено: {until}")
+        await cb.answer("Продлено")
         if c["tg_id"]:
             await services.safe_send(bot, c["tg_id"], texts.EXTENDED_USER.format(name=c["name"], until=until))
         if role == "admin" and c["dealer_id"]:
-            await services.tell_dealer(bot, db, c, f"✅ Администратор продлил ключ <b>{c['name']}</b>: {until}.")
-        await show_key(cb, db, cid, scope, bot_username, role, dealer)
+            await services.tell_dealer(bot, db, c, texts.DEALER_EXTENDED.format(name=c["name"], until=until))
+        await show_key(cb, db, cid, scope, bot_username, role, dealer, top=f"✅ Продлено: {until}")
 
     @r.callback_query(F.data.startswith("kr:"))
     async def cb_revoke_ask(cb: CallbackQuery, db: DB, role: str, dealer):
@@ -804,9 +885,10 @@ def build_staff_router(cfg: Config) -> Router:
         if not can_manage(role, dealer, c):
             return await cb.answer("Ключ не найден", show_alert=True)
         await cb.answer()
-        await edit(cb, f"⛔ Отключить ключ <b>{c['name']}</b>?\n"
-                       "Бот удалит его на сервере. Клиент больше не сможет подключиться.",
-                   ikb([("Да, отключить", f"kR:{cid}:{scope}"), ("Нет", f"k:{cid}:{scope}")]))
+        await show(cb, screen(f"⛔ Отключить ключ {c['name']}?",
+                              "Бот удалит ключ на сервере — клиент больше не сможет подключиться.",
+                              hint="Это нельзя отменить"),
+                   ikb([("⛔ Отключить", f"kR:{cid}:{scope}"), ("✖️ Отмена", f"k:{cid}:{scope}")]))
 
     @r.callback_query(F.data.startswith("kR:"))
     async def cb_revoke(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot, bot_username: str, role: str, dealer):
@@ -819,99 +901,49 @@ def build_staff_router(cfg: Config) -> Router:
         try:
             await services.revoke(bot, db, fleet, cid, texts.REVOKED_USER, dealer_why=why)
         except ERRORS as e:
-            return await edit(cb, f"❌ Не удалось отключить на сервере: {esc(str(e))}",
-                              ikb([("🔄 Ещё раз", f"kR:{cid}:{scope}")], [("⬅️ К ключу", f"k:{cid}:{scope}")]))
-        await show_key(cb, db, cid, scope, bot_username, role, dealer)
-
-    # любое другое сообщение диллера — показать меню
-    @r.message(StateFilter(None), F.text, ~F.text.startswith("/"))
-    async def staff_fallback(m: Message, role: str):
-        await m.answer(texts.ADMIN_WELCOME if role == "admin" else texts.DEALER_WELCOME,
-                       reply_markup=staff_keyboard(role))
+            return await show(cb, screen(f"⛔ Ключ {c['name']}", f"⚠️ Не удалось отключить на сервере:\n{esc(str(e))}"),
+                              ikb([("🔄 Повторить", f"kR:{cid}:{scope}")], nav(f"k:{cid}:{scope}")))
+        await show_key(cb, db, cid, scope, bot_username, role, dealer, top="⛔ Ключ отключён")
 
     return r
 
 
 # ======================= КЛИЕНТ =======================
-def build_user_router() -> Router:
-    r = Router(name="user")
+def build_client_router(cfg: Config) -> Router:
+    r = Router(name="client")
 
-    @r.message(CommandStart())
-    async def cmd_start(m: Message, command: CommandObject, state: FSMContext, db: DB, cfg: Config):
-        await state.clear()
-        token = (command.args or "").strip()
-        uid = m.from_user.id
-        if token.startswith("dl_"):  # ссылка диллера
-            d = db.dealer_by_token(token)
-            if not d or (d["tg_id"] and d["tg_id"] != uid):
-                return await m.answer(texts.DEALER_INVITE_INVALID)
-            db.bind_dealer(d["id"], uid, m.from_user.username)
-            await m.answer(texts.DEALER_JOINED.format(name=esc(d["name"])) + "\n\n" + texts.DEALER_WELCOME,
-                           reply_markup=dealer_keyboard())
-            who = f" (@{esc(m.from_user.username)})" if m.from_user.username else ""
-            return await services.notify_admins(m.bot, cfg, f"👥 Диллер «{esc(d['name'])}» подключился{who}.")
-        me_dealer = db.dealer_by_tg(uid)
-        if not token:
-            if uid in cfg.admin_ids:
-                return await m.answer(texts.ADMIN_WELCOME, reply_markup=admin_keyboard())
-            if me_dealer:
-                if not me_dealer["active"]:
-                    return await m.answer(texts.DEALER_BLOCKED)
-                return await m.answer(texts.DEALER_WELCOME, reply_markup=dealer_keyboard())
-            has = db.clients_of(uid)
-            return await m.answer(texts.WELCOME_BACK if has else texts.NO_KEYS, reply_markup=user_keyboard())
-        c = db.get_by_token(token)
-        if not c:
-            return await m.answer(texts.INVITE_INVALID)
-        if c["status"] != "active":
-            return await m.answer(texts.INVITE_REVOKED)
-        if c["tg_id"] and c["tg_id"] != m.from_user.id:
-            return await m.answer(texts.INVITE_TAKEN)
-        first_time = not c["tg_id"]
-        db.bind(c["id"], m.from_user.id, m.from_user.username)
-        await m.answer(texts.WELCOME_BOUND.format(name=c["name"]), reply_markup=user_keyboard())
-        await services.send_key(m.bot, m.chat.id, c, texts.KEY_CAPTION)
-        if first_time and c["dealer_id"]:
-            who = f" (@{esc(m.from_user.username)})" if m.from_user.username else ""
-            await services.tell_dealer(m.bot, db, c, texts.DEALER_CLIENT_BOUND.format(name=c["name"], who=who))
-
-    @r.message(Command("key"))
-    @r.message(F.text == texts.BTN_KEY)
-    async def btn_key(m: Message, db: DB):
-        keys = db.clients_of(m.from_user.id)
-        if not keys:
-            return await m.answer(texts.NO_KEYS)
+    @r.callback_query(F.data == "c:key")
+    async def cb_key(cb: CallbackQuery, db: DB, bot: Bot):
+        keys = db.clients_of(cb.from_user.id)
+        await cb.answer("Отправляю ключ" if keys else "Ключей нет")
         for c in keys:
-            await services.send_key(m.bot, m.chat.id, c, texts.KEY_CAPTION)
+            await services.send_key(bot, cb.message.chat.id, c, texts.KEY_CAPTION)
 
-    @r.message(F.text == texts.BTN_SUB)
-    async def btn_sub(m: Message, db: DB):
-        keys = db.clients_of(m.from_user.id)
-        if not keys:
-            return await m.answer(texts.NO_KEYS)
-        await m.answer("\n".join(
-            texts.SUB_LINE.format(name=c["name"], until=services.fmt_until(c["expires_at"])) for c in keys))
+    @r.callback_query(F.data == "c:howto")
+    async def cb_howto(cb: CallbackQuery):
+        await cb.answer()
+        await show(cb, screen("📲 Как подключиться", texts.HOWTO, hint=texts.HOWTO_HINT), ikb(nav()))
 
-    @r.message(F.text == texts.BTN_HOWTO)
-    async def btn_howto(m: Message):
-        await m.answer(texts.HOWTO, disable_web_page_preview=True)
-
-    @r.message(F.text == texts.BTN_SUPPORT)
-    async def btn_support(m: Message, cfg: Config, db: DB):
-        # клиент диллера пишет своему диллеру
-        for c in db.clients_of(m.from_user.id):
+    @r.callback_query(F.data == "c:support")
+    async def cb_support(cb: CallbackQuery, db: DB):
+        await cb.answer()
+        contact = None
+        for c in db.clients_of(cb.from_user.id):   # клиент диллера пишет своему диллеру
             d = db.dealer(c["dealer_id"])
             if d and d["active"] and d["tg_username"]:
-                return await m.answer(texts.SUPPORT.format(contact="@" + esc(d["tg_username"])))
-        await m.answer(texts.SUPPORT.format(contact=esc(cfg.support_contact))
-                       if cfg.support_contact else texts.SUPPORT_NONE)
+                contact = "@" + esc(d["tg_username"])
+                break
+        contact = contact or (esc(cfg.support_contact) if cfg.support_contact else None)
+        text = texts.SUPPORT.format(contact=contact) if contact else texts.SUPPORT_NONE
+        await show(cb, screen("🆘 Поддержка", text), ikb(nav()))
 
     @r.message()
     async def fallback(m: Message, db: DB):
-        d = db.dealer_by_tg(m.from_user.id)
-        if d and not d["active"]:
-            return await m.answer(texts.DEALER_BLOCKED)
-        has = db.clients_of(m.from_user.id)
-        await m.answer(texts.WELCOME_BACK if has else texts.NO_KEYS, reply_markup=user_keyboard())
+        text, kb = home_screen(cfg, db, m.from_user.id)
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        await open_panel(m.bot, m.chat.id, text, kb)
 
     return r

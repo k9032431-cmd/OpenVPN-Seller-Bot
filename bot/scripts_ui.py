@@ -7,15 +7,15 @@ from urllib.parse import urlparse
 
 import aiohttp
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
-from . import presets, texts
+from . import presets
 from .db import DB
 from .steps import ENTER_WORDS, RULE_RE, parse_steps
-from .ui import edit, ikb
+from .ui import fields, ikb, screen, show
+from .ui import nav as nav_row
 
 esc = html.escape
 MAX_FILE = 20 * 1024 * 1024
@@ -83,82 +83,74 @@ def fmt_size(n: int) -> str:
 
 
 # ======================= список и карточка =======================
-def scripts_list(db: DB) -> tuple[str, InlineKeyboardMarkup]:
+def scripts_list(db: DB, top: str = "") -> tuple[str, InlineKeyboardMarkup]:
     scripts = db.scripts()
-    rows = [[(("📜 " if s["enabled"] else "⏸ ") + s["name"] + ("" if s["enabled"] else " (выкл.)"),
-              f"sc:v:{s['id']}")] for s in scripts]
-    rows.append([("➕ Добавить скрипт", "sc:new")])
+    rows = [[(("📜 " if s["enabled"] else "⏸ ") + s["name"], f"sc:v:{s['id']}")] for s in scripts]
+    add = [("➕ Добавить скрипт", "sc:new")]
     if not any(s["name"] == "OpenVPN" for s in scripts):
-        rows.append([("⚡ Готовый: OpenVPN (ваш скрипт)", "sc:preset")])
-    text = ("📜 <b>Скрипты VPN</b>\n\n"
-            + ("Скриптов пока нет. Добавьте первый — бот проведёт по шагам.\n"
-               "Или нажмите «⚡ Готовый: OpenVPN» — всё уже заполнено." if not scripts else
-               "Бот ставит скрипт на сервер и создаёт ключи по его шагам.\n"
-               "Если включено несколько скриптов — при создании ключа бот спросит, какой."))
-    return text, ikb(*rows)
+        add.append(("⚡ Готовый: OpenVPN", "sc:preset"))
+    rows += [add, nav_row()]
+    if not scripts:
+        return screen("📜 Скрипты VPN", top, "Скриптов пока нет.",
+                      hint="«⚡ Готовый: OpenVPN» — ваш скрипт со всеми шагами уже заполнен"), ikb(*rows)
+    return screen("📜 Скрипты VPN", top, fields(("Всего", len(scripts)),
+                                                ("Включено", sum(1 for s in scripts if s["enabled"]))),
+                  hint="Бот ставит скрипт на сервер и создаёт ключи по его шагам"), ikb(*rows)
 
 
-def script_card(db: DB, script_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+def script_card(db: DB, script_id: int, top: str = "") -> tuple[str, InlineKeyboardMarkup] | None:
     s = db.script(script_id)
     if not s:
         return None
     if s["filename"]:
-        file = f"<code>{esc(s['filename'])}</code> · {fmt_size(len(s['content'] or b''))}"
-        if s["source_url"]:
-            file += f"\n      🌐 {esc(s['source_url'])}"
+        file = f"{esc(s['filename'])} · {fmt_size(len(s['content'] or b''))}"
     else:
-        file = "<i>без файла</i>"
+        file = "без файла"
     result = (f"файл <code>{esc(s['result_path'] or '—')}</code>" if s["result_type"] == "file" else
-              "вывод команд" + (f", фильтр <code>{esc(s['key_regex'])}</code>" if s["key_regex"] else ""))
+              "вывод команд" + (f" · <code>{esc(s['key_regex'])}</code>" if s["key_regex"] else ""))
     check = f"<code>{esc(s['check_cmd'])}</code>" if s["check_cmd"] else "⚠️ не задана"
-    text = (
-        f"📜 <b>{esc(s['name'])}</b>  {'✅' if s['enabled'] else '⏸ выключен'}\n\n"
-        f"📄 Файл: {file}\n"
-        f"💻 Установка: <b>{len(parse_steps(s['install_steps']))}</b> шаг.\n"
-        f"🔎 Проверка: {check}\n"
-        f"🔑 Создание ключа: <b>{len(parse_steps(s['key_steps']))}</b> шаг.\n"
-        f"📤 Ключ: {result}\n"
-        f"🗑 Удаление ключа: {len(parse_steps(s['delete_steps'])) or '—'}\n"
-        f"🌐 Смена IP: {len(parse_steps(s['ip_steps'])) or '—'}\n"
-        f"🖥 Установлен на серверах: <b>{db.script_servers(s['id'], s['version'])}</b> · версия {s['version']}"
-    )
+
+    def count(field):
+        n = len(parse_steps(s[field]))
+        return f"<b>{n}</b> шаг." if n else "—"
+
+    info = fields(("Статус", "✅ Включён" if s["enabled"] else "⏸ Выключен"), ("Файл", file),
+                  ("Установлен на серверах", db.script_servers(s["id"], s["version"])), ("Версия", s["version"]))
+    if s["source_url"]:
+        info += f"\nИсточник: {esc(s['source_url'])}"
+    steps = (f"<b>Шаги</b>\n💻 Установка: {count('install_steps')}\n🔎 Проверка: {check}\n"
+             f"🔑 Создание ключа: {count('key_steps')}\n📤 Ключ: {result}\n"
+             f"🗑 Удаление ключа: {count('delete_steps')}\n🌐 Смена IP: {count('ip_steps')}")
     i = s["id"]
     kb = ikb(
         [("✏️ Название", f"sc:e:{i}:name"), ("📄 Файл", f"sc:e:{i}:file")],
         [("💻 Установка", f"sc:e:{i}:install_steps"), ("🔎 Проверка", f"sc:e:{i}:check_cmd")],
         [("🔑 Создание ключа", f"sc:e:{i}:key_steps"), ("📤 Результат", f"sc:e:{i}:result")],
         [("🗑 Удаление ключа", f"sc:e:{i}:delete_steps"), ("🌐 Смена IP", f"sc:e:{i}:ip_steps")],
-        [("⏸ Выключить" if s["enabled"] else "▶️ Включить", f"sc:tog:{i}"),
-         ("🔄 Переустановить везде", f"sc:bump:{i}")],
-        [("👁 Показать все шаги", f"sc:show:{i}")],
-        [("❌ Удалить скрипт", f"sc:del:{i}")],
-        [("⬅️ К скриптам", "sc:list")],
+        [("👁 Все шаги", f"sc:show:{i}"), ("🔄 Переустановить везде", f"sc:bump:{i}")],
+        [("⏸ Выключить" if s["enabled"] else "▶️ Включить", f"sc:tog:{i}"), ("🗑 Удалить", f"sc:del:{i}")],
+        nav_row("sc:list"),
     )
-    return text, kb
+    return screen(f"📜 {esc(s['name'])}", top, info, steps, hint="Нажмите на поле, чтобы изменить его"), kb
 
 
 def build_scripts_router(cfg) -> Router:
     r = Router(name="scripts")
     is_admin = F.from_user.id.in_(cfg.admin_ids)
-    # кнопки главного меню обрабатывает основной роутер — их нельзя принять за шаг скрипта
-    r.message.filter(is_admin, ~F.text.in_(texts.MENU_BUTTONS))
+    r.message.filter(is_admin)
     r.callback_query.filter(is_admin)
 
-    async def show_card(target, db: DB, script_id: int):
-        card = script_card(db, script_id)
+    async def show_card(target, db: DB, script_id: int, top: str = ""):
+        card = script_card(db, script_id, top)
         if not card:
-            return await (target.answer("Скрипт не найден", show_alert=True) if isinstance(target, CallbackQuery)
-                          else target.answer("Скрипт не найден"))
-        if isinstance(target, CallbackQuery):
-            await edit(target, *card)
-        else:
-            await target.answer(card[0], reply_markup=card[1], disable_web_page_preview=True)
+            return await show(target, *scripts_list(db, top="⚠️ Скрипт не найден"))
+        await show(target, *card)
 
     @r.callback_query(F.data == "sc:list")
     async def cb_list(cb: CallbackQuery, state: FSMContext, db: DB):
         await state.clear()
         await cb.answer()
-        await edit(cb, *scripts_list(db))
+        await show(cb, *scripts_list(db))
 
     @r.callback_query(F.data.regexp(r"^sc:v:\d+$"))
     async def cb_view(cb: CallbackQuery, state: FSMContext, db: DB):
@@ -170,113 +162,101 @@ def build_scripts_router(cfg) -> Router:
     async def cb_show(cb: CallbackQuery, db: DB):
         s = db.script(int(cb.data.split(":")[2]))
         await cb.answer()
-        parts = [f"📜 <b>{esc(s['name'])}</b> — все шаги"]
-        for field, (emoji, title, _) in STEP_FIELDS.items():
-            parts.append(f"\n{emoji} <b>{title}</b>\n{pretty_steps(parse_steps(s[field]), 900)}")
-        await cb.message.answer("\n".join(parts)[:4000])
+        blocks = [f"<b>{emoji} {title}</b>\n{pretty_steps(parse_steps(s[field]), 700)}"
+                  for field, (emoji, title, _) in STEP_FIELDS.items()]
+        await show(cb, screen(f"👁 {esc(s['name'])} · все шаги", *blocks)[:4000], ikb(nav_row(f"sc:v:{s['id']}")))
 
     @r.callback_query(F.data == "sc:preset")
     async def cb_preset(cb: CallbackQuery, db: DB):
         sid = db.add_script(**presets.openvpn())
-        await cb.answer("Готовый скрипт OpenVPN добавлен")
-        await show_card(cb, db, sid)
+        await cb.answer("Готово")
+        await show_card(cb, db, sid, top="✅ Готовый скрипт OpenVPN добавлен")
 
     @r.callback_query(F.data.regexp(r"^sc:tog:\d+$"))
     async def cb_toggle(cb: CallbackQuery, db: DB):
         s = db.script(int(cb.data.split(":")[2]))
         db.update_script(s["id"], enabled=0 if s["enabled"] else 1)
-        await cb.answer()
+        await cb.answer("Выключен" if s["enabled"] else "Включён")
         await show_card(cb, db, s["id"])
 
     @r.callback_query(F.data.regexp(r"^sc:bump:\d+$"))
     async def cb_bump(cb: CallbackQuery, db: DB):
         i = int(cb.data.split(":")[2])
         db.bump_script(i)
-        await cb.answer("При следующем ключе на каждом сервере установка запустится заново "
-                        "(если «Проверка» не скажет, что всё уже установлено)", show_alert=True)
-        await show_card(cb, db, i)
+        await cb.answer("Готово")
+        await show_card(cb, db, i, top="🔄 При следующем ключе установка на серверах запустится заново "
+                                        "(если «Проверка» не скажет, что всё уже стоит)")
 
     @r.callback_query(F.data.regexp(r"^sc:del:\d+$"))
     async def cb_delete(cb: CallbackQuery, db: DB):
         s = db.script(int(cb.data.split(":")[2]))
         await cb.answer()
-        await edit(cb, f"⚠️ Удалить скрипт <b>{esc(s['name'])}</b>?\n\nСозданные ключи у клиентов останутся.",
-                   ikb([("Да, удалить", f"sc:delok:{s['id']}"), ("Нет", f"sc:v:{s['id']}")]))
+        await show(cb, screen(f"🗑 Удалить скрипт {esc(s['name'])}?", "Созданные ключи у клиентов останутся."),
+                   ikb([("🗑 Удалить", f"sc:delok:{s['id']}"), ("✖️ Отмена", f"sc:v:{s['id']}")]))
 
     @r.callback_query(F.data.regexp(r"^sc:delok:\d+$"))
     async def cb_delete_ok(cb: CallbackQuery, state: FSMContext, db: DB):
+        name = esc(db.script(int(cb.data.split(":")[2]))["name"])
         db.delete_script(int(cb.data.split(":")[2]))
-        await cb_list(cb, state, db)
+        await state.clear()
+        await cb.answer("Удалён")
+        await show(cb, *scripts_list(db, top=f"🗑 Скрипт {name} удалён"))
 
     # ======================= мастер / редактирование =======================
-    def header(data: dict) -> str:
+    def title(data: dict) -> str:
         if data.get("mode") == "wizard":
             n = WIZARD.index(data["field"] if data["field"] in WIZARD else "result") + 1
             name = data.get("draft", {}).get("name")
-            return f"➕ <b>Новый скрипт</b>{' · ' + esc(name) if name else ''} · шаг {n}/{len(WIZARD)}\n\n"
-        return f"✏️ <b>{esc(data.get('script_name', ''))}</b>\n\n"
+            return f"➕ Новый скрипт{' · ' + esc(name) if name else ''} · шаг {n} из {len(WIZARD)}"
+        return f"✏️ {esc(data.get('script_name', ''))}"
 
     def nav(data: dict, *extra) -> InlineKeyboardMarkup:
         wizard = data.get("mode") == "wizard"
-        back = ("❌ Отмена", "sc:list") if wizard else ("⬅️ Назад", f"sc:v:{data.get('script_id')}")
-        return ikb(*[row for row in extra if row], [back])
+        back = [("✖️ Отмена", "sc:list")] if wizard else nav_row(f"sc:v:{data.get('script_id')}")
+        return ikb(*[row for row in extra if row], back)
 
-    async def ask(target, state: FSMContext, field: str):
+    async def ask(target, state: FSMContext, field: str, error: str = ""):
         data = await state.get_data()
         data["field"] = field
         cur = data.get("current", {})
+        err = f"⚠️ {error}" if error else None
         if field == "name":
             await state.set_state(ScriptForm.name)
-            text = ("🏷 <b>Название скрипта</b>\n\nНапример: <code>OpenVPN</code>, <code>WireGuard</code>, "
-                    "<code>VLESS</code>." + (f"\n\nСейчас: <b>{esc(cur['name'])}</b>" if cur.get("name") else ""))
+            body = [("<b>🏷 Название скрипта</b>\nНапример: <code>OpenVPN</code>, <code>WireGuard</code>, "
+                     "<code>VLESS</code>"), f"Сейчас: <b>{esc(cur['name'])}</b>" if cur.get("name") else None]
             kb = nav(data)
         elif field == "file":
             await state.set_state(ScriptForm.file)
-            text = ("📄 <b>Файл скрипта</b>\n\n📤 Отправьте файл документом\n🌐 или ссылку на него "
-                    "(GitHub, raw-ссылка)\n\nФайл загрузится на сервер в <code>~/vpnbot/</code> и станет "
-                    "исполняемым." + (f"\n\nСейчас: <code>{esc(cur['filename'])}</code>" if cur.get("filename") else ""))
+            body = ["<b>📄 Файл скрипта</b>\n📤 Отправьте файл документом\n🌐 или ссылку на него (GitHub, raw)",
+                    f"Сейчас: <b>{esc(cur['filename'])}</b>" if cur.get("filename") else None]
             kb = nav(data, [("Без файла", "sc:f:nofile")])
+            hint_ = "Файл загрузится на сервер в ~/vpnbot/ и станет исполняемым"
         elif field in STEP_FIELDS:
             await state.set_state(ScriptForm.steps)
-            emoji, title, about = STEP_FIELDS[field]
+            emoji, name, about = STEP_FIELDS[field]
             steps = data.get("steps", [])
-            text = (f"{emoji} <b>{title}</b>\n{about}\n\n{STEPS_HELP}\n\n"
-                    f"<b>Шаги ({len(steps)}):</b>\n{pretty_steps(steps)}\n\n{PLACEHOLDERS}")
-            extra = [("✅ Готово", "sc:st:done")]
+            body = [f"<b>{emoji} {name}</b>\n{about}", STEPS_HELP,
+                    f"<b>Шаги ({len(steps)})</b>\n{pretty_steps(steps)}", PLACEHOLDERS]
             more = [("↩️ Убрать последний", "sc:st:undo"), ("🗑 Очистить", "sc:st:clear")] if steps else None
-            kb = nav(data, extra, more)
+            kb = nav(data, [("✅ Готово", "sc:st:done")], more)
         elif field == "check_cmd":
             await state.set_state(ScriptForm.check)
-            text = ("🔎 <b>Проверка установки</b> (необязательно)\n\n"
-                    "Команда, которая успешна, если скрипт <b>уже установлен</b>. Тогда бот не будет "
-                    "запускать установку повторно.\n\n⚠️ <b>Обязательно задайте, если скрипт при повторном "
-                    "запуске показывает меню</b> (как OpenVPN): иначе ответы установки попадут в меню.\n\n"
-                    "Пример для OpenVPN:\n<pre>test -f /etc/openvpn/server.conf</pre>"
-                    + (f"\nСейчас: <code>{esc(cur['check_cmd'])}</code>" if cur.get("check_cmd") else ""))
+            body = ["<b>🔎 Проверка установки</b> · необязательно\n"
+                    "Команда, которая успешна, если скрипт <b>уже установлен</b> — тогда бот не запустит "
+                    "установку повторно.",
+                    "⚠️ Обязательно задайте, если скрипт при повторном запуске показывает меню (как OpenVPN).",
+                    "Пример для OpenVPN:\n<code>test -f /etc/openvpn/server.conf</code>",
+                    f"Сейчас: <code>{esc(cur['check_cmd'])}</code>" if cur.get("check_cmd") else None]
             kb = nav(data, [("Пропустить" if data.get("mode") == "wizard" else "Убрать проверку", "sc:c:skip")])
         else:
             await state.set_state(ScriptForm.result_type)
-            text = ("📤 <b>Где взять ключ?</b>\n\n📄 <b>Файл на сервере</b> — скрипт создаёт файл "
-                    "(например <code>.ovpn</code>), бот скачает его.\n💻 <b>Вывод команд</b> — ключ "
-                    "печатается в терминал (например <code>vless://…</code>).")
+            body = ["<b>📤 Где взять ключ?</b>",
+                    "📄 <b>Файл на сервере</b> — скрипт создаёт файл (например .ovpn), бот скачает его\n"
+                    "💻 <b>Вывод команд</b> — ключ печатается в терминал (например vless://…)"]
             kb = nav(data, [("📄 Файл на сервере", "sc:r:file"), ("💻 Вывод команд", "sc:r:output")])
-        text = header(data) + text
+        hint = hint_ if field == "file" else ""
         await state.update_data(field=field)
-        if isinstance(target, CallbackQuery):
-            await edit(target, text, kb)
-            await state.update_data(prompt_id=target.message.message_id)
-            return
-        prompt_id = data.get("prompt_id")
-        if prompt_id:
-            try:
-                await target.bot.edit_message_text(text, chat_id=target.chat.id, message_id=prompt_id,
-                                                   reply_markup=kb, disable_web_page_preview=True)
-                return
-            except TelegramBadRequest as e:
-                if "not modified" in str(e):
-                    return
-        msg = await target.answer(text, reply_markup=kb, disable_web_page_preview=True)
-        await state.update_data(prompt_id=msg.message_id)
+        await show(target, screen(title(data), *body, err, hint=hint), kb)
 
     async def field_done(target, state: FSMContext, db: DB, **values):
         data = await state.get_data()
@@ -289,17 +269,13 @@ def build_scripts_router(cfg) -> Router:
                     draft["content"] = bytes.fromhex(draft["content"])
                 script_id = db.add_script(**draft)
                 await state.clear()
-                if isinstance(target, Message):
-                    await target.answer("✅ <b>Скрипт добавлен!</b>")
-                return await show_card(target, db, script_id)
+                return await show_card(target, db, script_id, top="✅ Скрипт добавлен")
             return await ask(target, state, WIZARD[idx + 1])
         if values.get("content") is not None:
             values["content"] = bytes.fromhex(values["content"])
         db.update_script(data["script_id"], **values)
         await state.clear()
-        if isinstance(target, Message):
-            await target.answer("✅ Сохранено.")
-        await show_card(target, db, data["script_id"])
+        await show_card(target, db, data["script_id"], top="✅ Сохранено")
 
     @r.callback_query(F.data == "sc:new")
     async def cb_new(cb: CallbackQuery, state: FSMContext):
@@ -319,15 +295,8 @@ def build_scripts_router(cfg) -> Router:
         await cb.answer()
         await ask(cb, state, field)
 
-    async def _delete(message: Message):
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-
     @r.message(ScriptForm.name, F.text)
     async def in_name(m: Message, state: FSMContext, db: DB):
-        await _delete(m)
         await field_done(m, state, db, name=m.text.strip()[:40])
 
     def raw_github(url: str) -> str:
@@ -340,7 +309,7 @@ def build_scripts_router(cfg) -> Router:
     @r.message(ScriptForm.file, F.document)
     async def in_file_doc(m: Message, state: FSMContext, db: DB):
         if m.document.file_size > MAX_FILE:
-            return await m.reply("❌ Файл больше 20 МБ.")
+            return await ask(m, state, "file", "Файл больше 20 МБ")
         content = (await m.bot.download(m.document)).read()
         await field_done(m, state, db, filename=safe_name(m.document.file_name or "script.sh"),
                          content=content.hex(), source_url=None)
@@ -350,8 +319,8 @@ def build_scripts_router(cfg) -> Router:
         url = raw_github(m.text.strip())
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            return await m.reply("❌ Отправьте файл документом или ссылку http(s)://…")
-        wait = await m.reply("⏳ Скачиваю…")
+            return await ask(m, state, "file", "Отправьте файл документом или ссылку http(s)://…")
+        await show(m, screen(title(await state.get_data()), "⏳ Скачиваю файл…"))
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
                 async with session.get(url, allow_redirects=True) as resp:
@@ -361,8 +330,7 @@ def build_scripts_router(cfg) -> Router:
             if len(content) > MAX_FILE:
                 raise ValueError("файл больше 20 МБ")
         except Exception as e:
-            return await wait.edit_text(f"❌ Не удалось скачать: {esc(str(e))}")
-        await _delete(wait)
+            return await ask(m, state, "file", f"Не удалось скачать: {esc(str(e))}")
         await field_done(m, state, db, filename=safe_name(parsed.path.rsplit("/", 1)[-1]),
                          content=content.hex(), source_url=url)
 
@@ -373,10 +341,8 @@ def build_scripts_router(cfg) -> Router:
 
     @r.message(ScriptForm.steps, F.text)
     async def in_steps(m: Message, state: FSMContext):
-        new = parse_steps(m.text)
-        await _delete(m)
         data = await state.get_data()
-        await state.update_data(steps=data.get("steps", []) + new)
+        await state.update_data(steps=data.get("steps", []) + parse_steps(m.text))
         await ask(m, state, data["field"])
 
     @r.callback_query(ScriptForm.steps, F.data.in_({"sc:st:undo", "sc:st:clear"}))
@@ -398,7 +364,6 @@ def build_scripts_router(cfg) -> Router:
 
     @r.message(ScriptForm.check, F.text)
     async def in_check(m: Message, state: FSMContext, db: DB):
-        await _delete(m)
         await field_done(m, state, db, check_cmd=m.text.strip())
 
     @r.callback_query(ScriptForm.check, F.data == "sc:c:skip")
@@ -406,27 +371,32 @@ def build_scripts_router(cfg) -> Router:
         await cb.answer()
         await field_done(cb, state, db, check_cmd="")
 
+    def path_screen(data, error=""):
+        return screen(title(data), "<b>📄 Путь к файлу ключа</b>\nГде скрипт сохраняет файл? "
+                      "Вместо названия ключа пишите <code>{name}</code>",
+                      "Пример для OpenVPN:\n<code>/root/{name}.ovpn</code>", f"⚠️ {error}" if error else None), nav(data)
+
+    def regex_screen(data, error=""):
+        return screen(title(data), "<b>🔎 Фильтр ключа</b>\nРегулярное выражение — из вывода возьмётся только "
+                      "совпадение.", "Пример для VLESS:\n<code>vless://\\S+</code>", f"⚠️ {error}" if error else None,
+                      hint="Или нажмите «Весь вывод»"), nav(data, [("Весь вывод", "sc:r:all")])
+
     @r.callback_query(ScriptForm.result_type, F.data.in_({"sc:r:file", "sc:r:output"}))
     async def cb_result_type(cb: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         await cb.answer()
         if cb.data == "sc:r:file":
             await state.set_state(ScriptForm.result_path)
-            await edit(cb, header(data) + "📄 <b>Путь к файлу ключа</b>\n\nГде скрипт сохраняет файл? "
-                       "Используйте <code>{name}</code> вместо названия ключа.\n\n"
-                       "Пример для OpenVPN:\n<pre>/root/{name}.ovpn</pre>", nav(data))
+            await show(cb, *path_screen(data))
         else:
             await state.set_state(ScriptForm.result_regex)
-            await edit(cb, header(data) + "🔎 <b>Фильтр ключа</b>\n\nРегулярное выражение — из вывода "
-                       "возьмётся только совпадение. Например для VLESS:\n<pre>vless://\\S+</pre>\n"
-                       "Или нажмите «Весь вывод».", nav(data, [("Весь вывод", "sc:r:all")]))
+            await show(cb, *regex_screen(data))
 
     @r.message(ScriptForm.result_path, F.text)
     async def in_result_path(m: Message, state: FSMContext, db: DB):
         path = m.text.strip()
         if "\n" in path or len(path) > 300:
-            return await m.reply("❌ Нужен один путь, например <code>/root/{name}.ovpn</code>")
-        await _delete(m)
+            return await show(m, *path_screen(await state.get_data(), "Нужен один путь, например /root/{name}.ovpn"))
         await field_done(m, state, db, result_type="file", result_path=path, key_regex="")
 
     @r.message(ScriptForm.result_regex, F.text)
@@ -434,8 +404,7 @@ def build_scripts_router(cfg) -> Router:
         try:
             re.compile(m.text.strip())
         except re.error as e:
-            return await m.reply(f"❌ Некорректное выражение: {esc(str(e))}")
-        await _delete(m)
+            return await show(m, *regex_screen(await state.get_data(), f"Некорректное выражение: {esc(str(e))}"))
         await field_done(m, state, db, result_type="output", key_regex=m.text.strip(), result_path="")
 
     @r.callback_query(ScriptForm.result_regex, F.data == "sc:r:all")
@@ -446,7 +415,9 @@ def build_scripts_router(cfg) -> Router:
     @r.message(ScriptForm.file)
     @r.message(ScriptForm.steps)
     @r.message(ScriptForm.name)
-    async def in_wrong(m: Message):
-        await m.reply("⚠️ Не тот формат. Следуйте подсказке выше.")
+    @r.message(ScriptForm.check)
+    async def in_wrong(m: Message, state: FSMContext):
+        data = await state.get_data()
+        await ask(m, state, data.get("field", "name"), "Не тот формат — следуйте подсказке")
 
     return r

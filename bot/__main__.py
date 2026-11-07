@@ -14,7 +14,8 @@ from . import services
 from .config import load_config
 from .db import DB
 from .engine import Fleet
-from .handlers import admin_keyboard, build_admin_router, build_staff_router, build_user_router
+from .handlers import build_admin_router, build_client_router, build_entry_router, build_staff_router
+from .ui import menu_keyboard
 from .scripts_ui import build_scripts_router
 
 
@@ -27,27 +28,22 @@ async def main() -> None:
 
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
-    await bot.set_my_commands([BotCommand(command="start", description="Меню"),
-                               BotCommand(command="key", description="Получить мой ключ")],
+    await bot.set_my_commands([BotCommand(command="start", description="🏠 Главное меню")],
                               scope=BotCommandScopeDefault())
 
     dp = Dispatcher()
-    dp.include_router(build_scripts_router(cfg))   # мастер скриптов — до общего «меню по умолчанию»
-    dp.include_router(build_admin_router(cfg))     # только главный админ
-    dp.include_router(build_staff_router(cfg))     # ключи: админ и диллеры
-    dp.include_router(build_user_router())
+    dp.include_router(build_entry_router(cfg))     # /start, «🏠 Главное меню», ссылки — для всех
+    dp.include_router(build_scripts_router(cfg))   # 📜 Скрипты — только главный админ
+    dp.include_router(build_admin_router(cfg))     # серверы, диллеры, рассылка — только главный админ
+    dp.include_router(build_staff_router(cfg))     # ключи — админ и диллеры
+    dp.include_router(build_client_router(cfg))    # клиенты
 
     tasks = [asyncio.create_task(services.expiry_loop(bot, db, fleet, cfg)),
              asyncio.create_task(services.watch_loop(bot, db, fleet, cfg))]
 
     logging.info("Бот @%s запущен: скриптов %d, серверов %d", me.username, len(db.scripts()), len(db.servers()))
-    if not db.scripts():
-        hint = "Начните с «📜 Скрипты» → «⚡ Готовый: OpenVPN» или «➕ Добавить скрипт»."
-    elif not db.servers():
-        hint = "Теперь добавьте сервер: «🖥 Серверы» → «➕ Добавить сервер»."
-    else:
-        hint = f"Серверов: {len(db.servers())}. Нажмите «❓ Как это работает», если впервые."
-    await services.notify_admins(bot, cfg, f"✅ Бот запущен. {hint}", reply_markup=admin_keyboard())
+    await services.notify_admins(bot, cfg, "✅ <b>Бот запущен</b>\nНажмите «🏠 Главное меню» внизу.",
+                                 reply_markup=menu_keyboard())
     try:
         await dp.start_polling(bot, db=db, fleet=fleet, cfg=cfg, bot_username=me.username)
     finally:
