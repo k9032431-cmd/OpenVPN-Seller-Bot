@@ -14,7 +14,7 @@ from . import services
 from .config import load_config
 from .db import DB
 from .engine import Fleet
-from .handlers import admin_keyboard, build_admin_router, build_user_router
+from .handlers import admin_keyboard, build_admin_router, build_staff_router, build_user_router
 from .scripts_ui import build_scripts_router
 
 
@@ -33,7 +33,8 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.include_router(build_scripts_router(cfg))   # мастер скриптов — до общего «меню по умолчанию»
-    dp.include_router(build_admin_router(cfg))
+    dp.include_router(build_admin_router(cfg))     # только главный админ
+    dp.include_router(build_staff_router(cfg))     # ключи: админ и диллеры
     dp.include_router(build_user_router())
 
     tasks = [asyncio.create_task(services.expiry_loop(bot, db, fleet, cfg)),

@@ -51,6 +51,15 @@ CREATE TABLE IF NOT EXISTS scripts (
     version       INTEGER NOT NULL DEFAULT 1,
     created_at    INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dealers (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT    NOT NULL,
+    tg_id        INTEGER UNIQUE,                 -- заполняется, когда диллер откроет ссылку
+    tg_username  TEXT,
+    invite_token TEXT    UNIQUE,
+    active       INTEGER NOT NULL DEFAULT 1,     -- 0 = заблокирован
+    created_at   INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS server_scripts (
     server_id INTEGER NOT NULL,
     script_id INTEGER NOT NULL,
@@ -59,7 +68,8 @@ CREATE TABLE IF NOT EXISTS server_scripts (
 );
 """
 
-CLIENT_COLUMNS = {"script_id": "INTEGER", "value": "BLOB", "filename": "TEXT"}
+# dealer_id: кто создал ключ (NULL — главный админ)
+CLIENT_COLUMNS = {"script_id": "INTEGER", "value": "BLOB", "filename": "TEXT", "dealer_id": "INTEGER"}
 SCRIPT_FIELDS = {"name", "filename", "content", "source_url", "install_steps", "check_cmd", "key_steps",
                  "result_type", "result_path", "key_regex", "delete_steps", "ip_steps", "enabled"}
 # изменение этих полей требует повторной установки на серверах
@@ -139,7 +149,7 @@ class DB:
         return self.conn.execute("SELECT * FROM clients WHERE invite_token=?", (token,)).fetchone()
 
     def add_client(self, sid: int, script_id: int, name: str, value: bytes, filename: Optional[str],
-                   days: int = 0, note: Optional[str] = None) -> int:
+                   days: int = 0, note: Optional[str] = None, dealer_id: Optional[int] = None) -> int:
         now = int(time.time())
         expires = now + days * DAY if days > 0 else None
         with self.conn:
@@ -147,8 +157,8 @@ class DB:
                 "DELETE FROM clients WHERE server_id=? AND name=? AND status='revoked'", (sid, name))
             cur = self.conn.execute(
                 "INSERT INTO clients(server_id, script_id, name, value, filename, invite_token, note,"
-                " created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (sid, script_id, name, value, filename, new_token(), note, now, expires))
+                " created_at, expires_at, dealer_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (sid, script_id, name, value, filename, new_token(), note, now, expires, dealer_id))
         return cur.lastrowid
 
     def name_taken(self, sid: int, name: str) -> bool:
@@ -197,8 +207,12 @@ class DB:
         with self.conn:
             self.conn.execute("UPDATE clients SET warned=1 WHERE id=?", (cid,))
 
-    def list_all(self) -> list[sqlite3.Row]:
-        return self.conn.execute("SELECT * FROM clients ORDER BY status, server_id, created_at").fetchall()
+    def list_all(self, dealer_id: Optional[int] = None) -> list[sqlite3.Row]:
+        """Все ключи (dealer_id=None) или только ключи одного диллера."""
+        if dealer_id is None:
+            return self.conn.execute("SELECT * FROM clients ORDER BY status, server_id, created_at").fetchall()
+        return self.conn.execute("SELECT * FROM clients WHERE dealer_id=? ORDER BY status, server_id, created_at",
+                                 (dealer_id,)).fetchall()
 
     def active(self, sid: Optional[int] = None) -> list[sqlite3.Row]:
         if sid is None:
@@ -288,3 +302,50 @@ class DB:
     def script_servers(self, script_id: int, version: int) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM server_scripts WHERE script_id=? AND version=?",
                                  (script_id, version)).fetchone()[0]
+
+    # ---------- диллеры ----------
+    def add_dealer(self, name: str) -> int:
+        with self.conn:
+            cur = self.conn.execute("INSERT INTO dealers(name, invite_token, created_at) VALUES (?,?,?)",
+                                    (name, "dl_" + new_token(), int(time.time())))
+        return cur.lastrowid
+
+    def dealer(self, did) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM dealers WHERE id=?", (did,)).fetchone() if did else None
+
+    def dealer_by_tg(self, tg_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM dealers WHERE tg_id=?", (tg_id,)).fetchone()
+
+    def dealer_by_token(self, token: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM dealers WHERE invite_token=?", (token,)).fetchone()
+
+    def dealers(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM dealers ORDER BY id").fetchall()
+
+    def bind_dealer(self, did: int, tg_id: int, username: Optional[str]) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE dealers SET tg_id=NULL, tg_username=NULL WHERE tg_id=? AND id<>?", (tg_id, did))
+            self.conn.execute("UPDATE dealers SET tg_id=?, tg_username=? WHERE id=?", (tg_id, username, did))
+
+    def reset_dealer_invite(self, did: int) -> str:
+        token = "dl_" + new_token()
+        with self.conn:
+            self.conn.execute("UPDATE dealers SET invite_token=?, tg_id=NULL, tg_username=NULL WHERE id=?",
+                              (token, did))
+        return token
+
+    def set_dealer_active(self, did: int, active: bool) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE dealers SET active=? WHERE id=?", (1 if active else 0, did))
+
+    def delete_dealer(self, did: int) -> None:
+        """Ключи диллера остаются и переходят главному админу."""
+        with self.conn:
+            self.conn.execute("UPDATE clients SET dealer_id=NULL WHERE dealer_id=?", (did,))
+            self.conn.execute("DELETE FROM dealers WHERE id=?", (did,))
+
+    def dealer_counts(self, did: int) -> tuple[int, int]:
+        """(активных ключей, всего ключей)."""
+        row = self.conn.execute(
+            "SELECT SUM(status='active'), COUNT(*) FROM clients WHERE dealer_id=?", (did,)).fetchone()
+        return row[0] or 0, row[1] or 0

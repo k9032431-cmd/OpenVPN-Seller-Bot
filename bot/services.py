@@ -80,6 +80,28 @@ async def push_configs(bot: Bot, db: DB, sid: int, caption: str) -> tuple[int, i
     return ok, fail
 
 
+async def notify_dealers(bot: Bot, db: DB, clients, header: str) -> None:
+    """Каждому диллеру — сообщение и обновлённые файлы его ключей из списка clients."""
+    by_dealer: dict[int, list] = {}
+    for c in clients:
+        if c["dealer_id"]:
+            by_dealer.setdefault(c["dealer_id"], []).append(c)
+    for did, items in by_dealer.items():
+        d = db.dealer(did)
+        if not d or not d["tg_id"]:
+            continue
+        await safe_send(bot, d["tg_id"], f"{header}\n\nВаших ключей: <b>{len(items)}</b> — обновлённые файлы ниже.")
+        for c in items:
+            await send_key(bot, d["tg_id"], c, texts.DEALER_KEY_CAPTION)
+            await asyncio.sleep(0.05)
+
+
+async def tell_dealer(bot: Bot, db: DB, client, text: str) -> None:
+    d = db.dealer(client["dealer_id"])
+    if d and d["tg_id"]:
+        await safe_send(bot, d["tg_id"], text)
+
+
 # ---------- смена IP ----------
 async def change_address(bot: Bot, db: DB, fleet: Fleet, sid: int, new_host: str,
                          progress: Progress = _noop) -> tuple[int, int, int, list[str]]:
@@ -105,8 +127,10 @@ async def change_address(bot: Bot, db: DB, fleet: Fleet, sid: int, new_host: str
         if old_b in value:
             db.set_value(c["id"], value.replace(old_b, new_b))
             updated += 1
-    await progress(f"🔑 Обновлено ключей: {updated}. Рассылаю клиентам…")
+    await progress(f"🔑 Обновлено ключей: {updated}. Рассылаю клиентам и диллерам…")
     ok, fail = await push_configs(bot, db, sid, texts.IP_CHANGED_CAPTION)
+    await notify_dealers(bot, db, db.active(sid), texts.DEALER_IP_CHANGED.format(
+        server=esc(server["name"]), old=old, new=esc(new_host)))
     return updated, ok, fail, warnings
 
 
@@ -117,6 +141,7 @@ async def transfer_clients(bot: Bot, db: DB, fleet: Fleet, src: int, dst: int,
     target = db.server(dst)
     errors = []
     ok = 0
+    moved_ids = []
     clients = db.active(src)
     for i, c in enumerate(clients, 1):
         script = db.script(c["script_id"]) or next(iter(db.scripts(only_enabled=True)), None)
@@ -138,26 +163,36 @@ async def transfer_clients(bot: Bot, db: DB, fleet: Fleet, src: int, dst: int,
             pass
         db.move_client(c["id"], dst, name, value, filename)
         moved = db.get(c["id"])
+        moved_ids.append(c["id"])
         if moved["tg_id"]:
             await send_key(bot, moved["tg_id"], moved, texts.MOVED_CAPTION)
         ok += 1
+    await notify_dealers(bot, db, [db.get(i) for i in moved_ids], texts.DEALER_MOVED.format(
+        server=esc(target["name"])))
     return ok, errors
 
 
 async def delete_server(bot: Bot, db: DB, fleet: Fleet, sid: int) -> None:
+    server = db.server(sid)
     for c in db.active(sid):
         if c["tg_id"]:
             await safe_send(bot, c["tg_id"], texts.REVOKED_USER.format(name=c["name"]))
+        await tell_dealer(bot, db, c, texts.DEALER_KEY_OFF.format(
+            name=c["name"], why=f"сервер «{esc(server['name'])}» удалён"))
     fleet.forget(sid)
     db.delete_server(sid)
 
 
-async def revoke(bot: Bot, db: DB, fleet: Fleet, cid: int, user_text: Optional[str]) -> None:
+async def revoke(bot: Bot, db: DB, fleet: Fleet, cid: int, user_text: Optional[str],
+                 dealer_why: Optional[str] = None) -> None:
+    """Отключает ключ. dealer_why — причина для диллера (если ключ его и отключил не он сам)."""
     c = db.get(cid)
     await engine.delete_key(fleet, db, c)
     db.set_status(cid, "revoked")
     if user_text and c["tg_id"]:
         await safe_send(bot, c["tg_id"], user_text.format(name=esc(c["name"])))
+    if dealer_why:
+        await tell_dealer(bot, db, c, texts.DEALER_KEY_OFF.format(name=c["name"], why=dealer_why))
 
 
 # ---------- фоновые задачи ----------
@@ -193,7 +228,7 @@ async def expiry_loop(bot: Bot, db: DB, fleet: Fleet, cfg: Config) -> None:
             now = int(time.time())
             for c in db.expired(now):
                 try:
-                    await revoke(bot, db, fleet, c["id"], texts.EXPIRED_USER)
+                    await revoke(bot, db, fleet, c["id"], texts.EXPIRED_USER, dealer_why="закончился срок")
                     await notify_admins(bot, cfg, f"⛔ Ключ <b>{esc(c['name'])}</b> истёк и отключён.")
                 except ERRORS as e:  # сервер недоступен — попробуем позже
                     log.warning("Не удалось отключить %s: %s", c["name"], e)
@@ -202,6 +237,8 @@ async def expiry_loop(bot: Bot, db: DB, fleet: Fleet, cfg: Config) -> None:
                     if c["tg_id"]:
                         await safe_send(bot, c["tg_id"], texts.EXPIRE_WARN.format(
                             name=c["name"], date=fmt_date(c["expires_at"])))
+                    await tell_dealer(bot, db, c, texts.DEALER_EXPIRING.format(
+                        name=c["name"], date=fmt_date(c["expires_at"])))
                     db.mark_warned(c["id"])
         except asyncio.CancelledError:
             raise
