@@ -20,7 +20,8 @@ from aiogram import Bot, F, Router
 from aiogram.filters import CommandObject, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from . import engine, services, texts
 from .config import Config
@@ -68,6 +69,18 @@ class AddDealer(StatesGroup):
     name = State()
 
 
+class SetLimit(StatesGroup):
+    value = State()
+
+
+class SupportMsg(StatesGroup):
+    text = State()
+
+
+class SupportReply(StatesGroup):
+    text = State()
+
+
 # ======================= роли =======================
 def role_of(cfg: Config, db: DB, uid: int) -> tuple[str, object]:
     """('admin'|'dealer'|'blocked'|'client', строка диллера или None)."""
@@ -90,6 +103,13 @@ class Staff(Filter):
         return {"role": role, "dealer": dealer} if role in ("admin", "dealer") else False
 
 
+def client_label(db: DB, uid: int) -> str:
+    for c in db.clients_of(uid):
+        if c["tg_username"]:
+            return "@" + esc(c["tg_username"])
+    return f"ID {uid}"
+
+
 def name_of(row) -> str:
     return esc(row["name"]) if row else "—"
 
@@ -100,6 +120,11 @@ def invite_link(bot_username: str, token: str) -> str:
 
 def short_date(ts) -> str:
     return services.fmt_date(ts)[:10] if ts else "♾"
+
+
+def limit_text(db: DB, d) -> str:
+    active, _ = db.dealer_counts(d["id"])
+    return f"{active} из {d['key_limit']}" if d["key_limit"] is not None else f"{active} · без лимита"
 
 
 def key_status(c) -> str:
@@ -132,7 +157,7 @@ def home_screen(cfg: Config, db: DB, uid: int):
         kb = ikb([(texts.BTN_NEW, "new")],
                  [(texts.BTN_MY_KEYS, f"kp:0:d{dealer['id']}"), (texts.BTN_HELP, "help")])
         return screen("🏠 Главное меню",
-                      fields(("👤 Диллер", esc(dealer["name"])), ("🔑 Активных ключей", active),
+                      fields(("👤 Диллер", esc(dealer["name"])), ("🔑 Активных ключей", limit_text(db, dealer)),
                              ("📦 Всего ключей", total)),
                       hint="Выберите раздел"), kb
     if role == "blocked":
@@ -280,7 +305,8 @@ def dealers_screen(db: DB, top: str = ""):
     for d in db.dealers():
         active, _ = db.dealer_counts(d["id"])
         icon = "⏸" if not d["active"] else ("👤" if d["tg_id"] else "🔗")
-        rows.append([(f"{icon} {d['name']} · 🔑 {active}", f"dl:{d['id']}")])
+        lim = f"/{d['key_limit']}" if d["key_limit"] is not None else ""
+        rows.append([(f"{icon} {d['name']} · 🔑 {active}{lim}", f"dl:{d['id']}")])
     count = len(rows)
     rows += [[("➕ Добавить диллера", "dla")], nav()]
     if not count:
@@ -298,10 +324,10 @@ def dealer_screen(db: DB, did: int, bot_username: str, top: str = ""):
     tg = (f"@{esc(d['tg_username'])}" if d["tg_username"] else f"ID {d['tg_id']}") if d["tg_id"] else None
     info = fields(("Статус", "🟢 Активен" if d["active"] else "⏸ Заблокирован"),
                   ("Telegram", tg or "ещё не открыл ссылку"),
-                  ("Активных ключей", active), ("Всего ключей", total),
+                  ("Активных ключей", limit_text(db, d)), ("Всего ключей", total),
                   ("Добавлен", services.fmt_date(d["created_at"])[:10]))
     link = None if d["tg_id"] else f"<b>🔗 Ссылка для диллера</b>\n{invite_link(bot_username, d['invite_token'])}"
-    kb = ikb([("📋 Ключи диллера", f"kp:0:d{did}")],
+    kb = ikb([("📋 Ключи диллера", f"kp:0:d{did}"), ("🎚 Лимит ключей", f"dlm:{did}")],
              [("⏸ Заблокировать", f"dlb:{did}") if d["active"] else ("▶️ Разблокировать", f"dlb:{did}"),
               ("🔗 Новая ссылка", f"dll:{did}")],
              [("🗑 Удалить диллера", f"dld:{did}")],
@@ -711,6 +737,52 @@ def build_admin_router(cfg: Config) -> Router:
             await services.safe_send(bot, d["tg_id"], texts.DEALER_BLOCKED if d["active"] else texts.DEALER_UNBLOCKED)
         await show(cb, *dealer_screen(db, did, bot_username))
 
+    def limit_screen(db: DB, did: int, error: str = ""):
+        d = db.dealer(did)
+        active, _ = db.dealer_counts(did)
+        return screen(f"🎚 Лимит ключей · {esc(d['name'])}",
+                      fields(("Сейчас", d["key_limit"] if d["key_limit"] is not None else "без лимита"),
+                             ("Активных ключей", active)),
+                      "Сколько <b>активных</b> ключей может быть у диллера?\n"
+                      "<i>Нажмите кнопку или напишите число</i>",
+                      f"⚠️ {error}" if error else None,
+                      hint="Отключённые и истёкшие ключи место не занимают. Продление лимит не тратит"), \
+            ikb([("5", f"dlms:{did}:5"), ("10", f"dlms:{did}:10"), ("20", f"dlms:{did}:20"), ("50", f"dlms:{did}:50")],
+                [("♾ Без лимита", f"dlms:{did}:-1")], nav(f"dl:{did}"))
+
+    async def apply_limit(db: DB, bot: Bot, did: int, limit):
+        db.set_dealer_limit(did, limit)
+        d = db.dealer(did)
+        if d["tg_id"]:
+            await services.safe_send(bot, d["tg_id"], texts.DEALER_LIMIT_CHANGED.format(
+                limit=f"{limit} активных ключей" if limit is not None else "без лимита"))
+        return "без лимита" if limit is None else str(limit)
+
+    @r.callback_query(F.data.startswith("dlm:"))
+    async def cb_dealer_limit(cb: CallbackQuery, state: FSMContext, db: DB):
+        did = int(cb.data[4:])
+        await cb.answer()
+        await state.set_state(SetLimit.value)
+        await state.update_data(did=did)
+        await show(cb, *limit_screen(db, did))
+
+    @r.callback_query(F.data.startswith("dlms:"))
+    async def cb_dealer_limit_set(cb: CallbackQuery, state: FSMContext, db: DB, bot: Bot, bot_username: str):
+        _, did, value = cb.data.split(":")
+        await state.clear()
+        shown = await apply_limit(db, bot, int(did), None if value == "-1" else int(value))
+        await cb.answer("Сохранено")
+        await show(cb, *dealer_screen(db, int(did), bot_username, top=f"🎚 Лимит ключей: {shown}"))
+
+    @r.message(SetLimit.value, F.text)
+    async def dealer_limit_text(m: Message, state: FSMContext, db: DB, bot: Bot, bot_username: str):
+        did = (await state.get_data())["did"]
+        if not m.text.strip().isdigit() or int(m.text.strip()) > 100000:
+            return await show(m, *limit_screen(db, did, "Напишите число, например 15"))
+        await state.clear()
+        shown = await apply_limit(db, bot, did, int(m.text.strip()))
+        await show(m, *dealer_screen(db, did, bot_username, top=f"🎚 Лимит ключей: {shown}"))
+
     @r.callback_query(F.data.startswith("dll:"))
     async def cb_dealer_link(cb: CallbackQuery, db: DB, bot_username: str):
         did = int(cb.data[4:])
@@ -798,9 +870,13 @@ def build_staff_router(cfg: Config) -> Router:
     DAYS_ROWS = ([("7 дней", "nd:7"), ("30 дней", "nd:30")], [("90 дней", "nd:90"), ("♾ Бессрочно", "nd:0")])
 
     @r.callback_query(F.data == "new")
-    async def cb_new(cb: CallbackQuery, state: FSMContext, db: DB, role: str):
+    async def cb_new(cb: CallbackQuery, state: FSMContext, db: DB, role: str, dealer):
         await state.clear()
         await cb.answer()
+        if role == "dealer" and db.dealer_slots_left(dealer["id"]) == 0:
+            active, _ = db.dealer_counts(dealer["id"])
+            return await show(cb, screen("➕ Новый ключ", texts.DEALER_LIMIT_REACHED.format(
+                active=active, limit=dealer["key_limit"])), ikb([(texts.BTN_MY_KEYS, f"kp:0:d{dealer['id']}")], nav()))
         servers, scripts = db.servers(), db.scripts(only_enabled=True)
         if not scripts or not servers:
             if role == "admin":
@@ -859,6 +935,10 @@ def build_staff_router(cfg: Config) -> Router:
         data = await state.get_data()
         await state.clear()
         server, script, name = db.server(data["sid"]), db.script(data["scid"]), data["name"]
+        if role == "dealer" and db.dealer_slots_left(dealer["id"]) == 0:   # лимит мог кончиться, пока вводили имя
+            active, _ = db.dealer_counts(dealer["id"])
+            return await show(event, screen("➕ Новый ключ", texts.DEALER_LIMIT_REACHED.format(
+                active=active, limit=db.dealer(dealer["id"])["key_limit"])), ikb(nav()))
         header = screen(f"🔑 Создание ключа {name}", fields(("Сервер", name_of(server)), ("VPN", name_of(script))))
         panel = await show(event, header)
         live = Live(panel, header)
@@ -897,6 +977,34 @@ def build_staff_router(cfg: Config) -> Router:
     async def new_days_bad(m: Message, state: FSMContext, db: DB):
         await show(m, *new_key_screen(db, await state.get_data(), DAYS_Q,
                                       "Нажмите кнопку или напишите число дней (0 — бессрочно)", DAYS_ROWS))
+
+    # ---------- поддержка: ответ клиенту ----------
+    def can_reply(db: DB, role: str, dealer, client_uid: int) -> bool:
+        return role == "admin" or any(c["dealer_id"] == dealer["id"] for c in db.clients_of(client_uid))
+
+    @r.callback_query(F.data.startswith("rep:"))
+    async def cb_reply(cb: CallbackQuery, state: FSMContext, db: DB, role: str, dealer):
+        uid = int(cb.data[4:])
+        if not can_reply(db, role, dealer, uid):
+            return await cb.answer("Это не ваш клиент", show_alert=True)
+        await cb.answer()
+        await state.set_state(SupportReply.text)
+        await state.update_data(uid=uid, who=client_label(db, uid))
+        await open_panel(cb.bot, cb.message.chat.id,
+                         texts.SUPPORT_REPLY_ASK.format(who=client_label(db, uid)), ikb(CANCEL))
+
+    @r.message(SupportReply.text)
+    async def reply_text(m: Message, state: FSMContext, db: DB, bot: Bot):
+        data = await state.get_data()
+        await state.clear()
+        kb = ikb([(texts.BTN_WRITE, "c:write")])
+        try:
+            await bot.send_message(data["uid"], texts.SUPPORT_REPLY_HEADER)
+            await m.copy_to(data["uid"], reply_markup=kb)
+            text = texts.SUPPORT_REPLY_SENT.format(who=data["who"])
+        except (TelegramBadRequest, TelegramForbiddenError):
+            text = f"⚠️ Не удалось доставить ответ {data['who']} — клиент заблокировал бота."
+        await open_panel(bot, m.chat.id, text, ikb(nav()))
 
     # ---------- список и карточка ключа ----------
     @r.callback_query(F.data.startswith("kp:"))
@@ -1005,18 +1113,52 @@ def build_client_router(cfg: Config) -> Router:
         await cb.answer()
         await show(cb, screen("📲 Как подключиться", texts.HOWTO, hint=texts.HOWTO_HINT), ikb(nav()))
 
+    def support_targets(db: DB, uid: int) -> tuple[list[int], Optional[str]]:
+        """Кому идёт вопрос клиента: диллеру его ключа, иначе главным админам. → (кому, @username)."""
+        for c in db.clients_of(uid):
+            d = db.dealer(c["dealer_id"])
+            if d and d["active"] and d["tg_id"]:
+                return [d["tg_id"]], d["tg_username"]
+        contact = cfg.support_contact.lstrip("@") if cfg.support_contact and not cfg.support_contact.lstrip("@").isdigit() else None
+        return list(cfg.admin_ids), contact
+
     @r.callback_query(F.data == "c:support")
     async def cb_support(cb: CallbackQuery, db: DB):
         await cb.answer()
-        contact = None
-        for c in db.clients_of(cb.from_user.id):   # клиент диллера пишет своему диллеру
-            d = db.dealer(c["dealer_id"])
-            if d and d["active"] and d["tg_username"]:
-                contact = "@" + esc(d["tg_username"])
-                break
-        contact = contact or (esc(cfg.support_contact) if cfg.support_contact else None)
-        text = texts.SUPPORT.format(contact=contact) if contact else texts.SUPPORT_NONE
-        await show(cb, screen("🆘 Поддержка", text), ikb(nav()))
+        _, username = support_targets(db, cb.from_user.id)
+        rows = [[(texts.BTN_WRITE, "c:write")]]
+        blocks = [texts.SUPPORT]
+        markup = ikb(*rows, nav())
+        if username:
+            blocks.append(texts.SUPPORT_CONTACT.format(contact="@" + esc(username)))
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=texts.BTN_WRITE, callback_data="c:write")],
+                [InlineKeyboardButton(text=f"💬 Открыть чат @{username}", url=f"https://t.me/{username}")],
+                [InlineKeyboardButton(text="🏠 Меню", callback_data="home")]])
+        await show(cb, screen("🆘 Поддержка", *blocks), markup)
+
+    @r.callback_query(F.data == "c:write")
+    async def cb_write(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        await state.set_state(SupportMsg.text)
+        await open_panel(cb.bot, cb.message.chat.id, screen("✍️ Вопрос в поддержку", texts.SUPPORT_ASK), ikb(CANCEL))
+
+    @r.message(SupportMsg.text)
+    async def support_text(m: Message, state: FSMContext, db: DB, bot: Bot):
+        await state.clear()
+        targets, _ = support_targets(db, m.from_user.id)
+        keys = ", ".join(c["name"] for c in db.clients_of(m.from_user.id)) or "нет"
+        header = texts.SUPPORT_TO_STAFF.format(who=client_label(db, m.from_user.id), keys=esc(keys))
+        delivered = 0
+        for t in targets:
+            try:
+                await bot.send_message(t, header, reply_markup=ikb([("↩️ Ответить", f"rep:{m.from_user.id}")]))
+                await m.copy_to(t)
+                delivered += 1
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
+        text = texts.SUPPORT_SENT if delivered else "⚠️ Не удалось отправить. Попробуйте позже."
+        await open_panel(bot, m.chat.id, screen("🆘 Поддержка", text), ikb(nav()))
 
     @r.message()
     async def fallback(m: Message, db: DB):

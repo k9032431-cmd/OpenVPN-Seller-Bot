@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS dealers (
     tg_username  TEXT,
     invite_token TEXT    UNIQUE,
     active       INTEGER NOT NULL DEFAULT 1,     -- 0 = заблокирован
-    created_at   INTEGER NOT NULL
+    created_at   INTEGER NOT NULL,
+    key_limit    INTEGER                         -- макс. активных ключей; NULL = без лимита
 );
 CREATE TABLE IF NOT EXISTS server_scripts (
     server_id INTEGER NOT NULL,
@@ -93,6 +94,8 @@ class DB:
             for col, typ in CLIENT_COLUMNS.items():
                 if col not in have:
                     self.conn.execute(f"ALTER TABLE clients ADD COLUMN {col} {typ}")
+            if "key_limit" not in {r[1] for r in self.conn.execute("PRAGMA table_info(dealers)")}:
+                self.conn.execute("ALTER TABLE dealers ADD COLUMN key_limit INTEGER")
 
     def _migrate(self) -> None:
         """Старая версия базы (без серверов) → новая."""
@@ -362,3 +365,16 @@ class DB:
         row = self.conn.execute(
             "SELECT SUM(status='active'), COUNT(*) FROM clients WHERE dealer_id=?", (did,)).fetchone()
         return row[0] or 0, row[1] or 0
+
+    def set_dealer_limit(self, did: int, limit: Optional[int]) -> None:
+        """limit=None — без лимита."""
+        with self.conn:
+            self.conn.execute("UPDATE dealers SET key_limit=? WHERE id=?", (limit, did))
+
+    def dealer_slots_left(self, did: int) -> Optional[int]:
+        """Сколько ещё активных ключей может создать диллер (None — без лимита)."""
+        d = self.dealer(did)
+        if d is None or d["key_limit"] is None:
+            return None
+        active, _ = self.dealer_counts(did)
+        return max(0, d["key_limit"] - active)
