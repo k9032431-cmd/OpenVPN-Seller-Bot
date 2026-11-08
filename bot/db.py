@@ -378,3 +378,16 @@ class DB:
             return None
         active, _ = self.dealer_counts(did)
         return max(0, d["key_limit"] - active)
+
+    def delete_client(self, cid: int) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM clients WHERE id=?", (cid,))
+
+    def delete_revoked(self, dealer_id: Optional[int] = None) -> int:
+        """Удаляет отключённые ключи (все или одного диллера). → сколько удалено."""
+        with self.conn:
+            if dealer_id is None:
+                cur = self.conn.execute("DELETE FROM clients WHERE status='revoked'")
+            else:
+                cur = self.conn.execute("DELETE FROM clients WHERE status='revoked' AND dealer_id=?", (dealer_id,))
+        return cur.rowcount

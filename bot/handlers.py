@@ -189,7 +189,7 @@ def can_manage(role: str, dealer, c) -> bool:
     return c is not None and (role == "admin" or c["dealer_id"] == dealer["id"])
 
 
-def keys_screen(db: DB, page: int, scope: str, dealer_id: Optional[int], admin_view: bool):
+def keys_screen(db: DB, page: int, scope: str, dealer_id: Optional[int], admin_view: bool, top: str = ""):
     rows = db.list_all(dealer_id)
     servers = db.servers()
     srv = {s["id"]: s["name"][:10] for s in servers}
@@ -205,6 +205,9 @@ def keys_screen(db: DB, page: int, scope: str, dealer_id: Optional[int], admin_v
     if pages > 1:
         buttons.append([("◀️", f"kp:{page - 1}:{scope}"), (f"{page + 1} / {pages}", "noop"),
                         ("▶️", f"kp:{page + 1}:{scope}")])
+    revoked = sum(1 for c in rows if c["status"] != "active")
+    if revoked:
+        buttons.append([(f"🧹 Удалить отключённые ({revoked})", f"kx:{scope}")])
     if admin_view and dealer_id is not None:
         title = f"📋 Ключи диллера {name_of(db.dealer(dealer_id))}"
         buttons.append(nav(f"dl:{dealer_id}"))
@@ -213,9 +216,9 @@ def keys_screen(db: DB, page: int, scope: str, dealer_id: Optional[int], admin_v
         buttons.append([(texts.BTN_NEW, "new")])
         buttons.append(nav())
     if not rows:
-        return screen(title, "Ключей пока нет.", hint="Создайте первый: «➕ Новый ключ»"), ikb(*buttons)
+        return screen(title, top, "Ключей пока нет.", hint="Создайте первый: «➕ Новый ключ»"), ikb(*buttons)
     active = sum(1 for c in rows if c["status"] == "active")
-    return screen(title, fields(("Всего", len(rows)), ("Активных", active)),
+    return screen(title, top, fields(("Всего", len(rows)), ("Активных", active)),
                   hint="🟢 активен · 🔴 отключён · 👤 у клиента · 🔗 ссылку ещё не открыли"), ikb(*buttons)
 
 
@@ -238,10 +241,10 @@ def key_screen(db: DB, c, bot_username: str, scope: str, admin_view: bool, top: 
     i = c["id"]
     back = nav(f"kp:0:{scope}")
     if c["status"] != "active":
-        return screen(f"🔑 {c['name']}", top, info), ikb(back)
+        return screen(f"🔑 {c['name']}", top, info), ikb([("🗑 Удалить ключ", f"kd:{i}:{scope}")], back)
     kb = ikb([("📄 Файл ключа", f"kf:{i}"), ("🔗 Новая ссылка", f"kl:{i}:{scope}")],
              [("+30 дней", f"ke:{i}:30:{scope}"), ("+90 дней", f"ke:{i}:90:{scope}"), ("♾ Бессрочно", f"ke:{i}:0:{scope}")],
-             [("⛔ Отключить ключ", f"kr:{i}:{scope}")],
+             [("⛔ Отключить", f"kr:{i}:{scope}"), ("🗑 Удалить", f"kd:{i}:{scope}")],
              back)
     hint = "Перешлите ссылку клиенту — он нажмёт «Запустить» и получит ключ" if link else ""
     return screen(f"🔑 {c['name']}", top, info, link, hint=hint), kb
@@ -978,9 +981,78 @@ def build_staff_router(cfg: Config) -> Router:
         await show(m, *new_key_screen(db, await state.get_data(), DAYS_Q,
                                       "Нажмите кнопку или напишите число дней (0 — бессрочно)", DAYS_ROWS))
 
+    # ---------- удаление ключей ----------
+    @r.callback_query(F.data.startswith("kd:"))
+    async def cb_delete_ask(cb: CallbackQuery, db: DB, role: str, dealer):
+        cid, _, scope = parse(cb, role, dealer)
+        c = db.get(cid)
+        if not can_manage(role, dealer, c):
+            return await cb.answer("Ключ не найден", show_alert=True)
+        await cb.answer()
+        what = ("Бот удалит ключ на сервере и из бота — клиент больше не сможет подключиться."
+                if c["status"] == "active" else "Ключ уже отключён — он просто исчезнет из списка.")
+        await show(cb, screen(f"🗑 Удалить ключ {c['name']}?", what, hint="Это нельзя отменить"),
+                   ikb([("🗑 Удалить", f"kD:{cid}:{scope}"), ("✖️ Отмена", f"k:{cid}:{scope}")]))
+
+    async def finish_delete(cb: CallbackQuery, db: DB, bot: Bot, c, scope: str, role: str, dealer, notify: bool):
+        if notify and c["status"] == "active":   # сервер недоступен — сообщаем сами
+            if c["tg_id"]:
+                await services.safe_send(bot, c["tg_id"], texts.REVOKED_USER.format(name=c["name"]))
+            if role == "admin" and c["dealer_id"]:
+                await services.tell_dealer(bot, db, c, texts.DEALER_KEY_OFF.format(
+                    name=c["name"], why="удалил администратор"))
+        db.delete_client(c["id"])
+        _, did = resolve_scope(role, dealer, scope)
+        await show(cb, *keys_screen(db, 0, scope, did, role == "admin", top=f"🗑 Ключ {c['name']} удалён"))
+
+    @r.callback_query(F.data.startswith("kD:"))
+    async def cb_delete(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot, role: str, dealer):
+        cid, _, scope = parse(cb, role, dealer)
+        c = db.get(cid)
+        if not can_manage(role, dealer, c):
+            return await cb.answer("Ключ не найден", show_alert=True)
+        await cb.answer("Удаляю…")
+        if c["status"] == "active":
+            why = "удалил администратор" if role == "admin" and c["dealer_id"] else None
+            try:
+                await services.revoke(bot, db, fleet, cid, texts.REVOKED_USER, dealer_why=why)
+            except ERRORS as e:
+                return await show(cb, screen(f"🗑 Ключ {c['name']}",
+                                             f"⚠️ Не удалось удалить на сервере:\n{esc(str(e))}",
+                                             hint="Можно удалить только из бота — на сервере ключ останется рабочим, "
+                                                  "пока сервер недоступен"),
+                                  ikb([("🔄 Повторить", f"kD:{cid}:{scope}")],
+                                      [("🗑 Удалить только из бота", f"kF:{cid}:{scope}")], nav(f"k:{cid}:{scope}")))
+        await finish_delete(cb, db, bot, db.get(cid), scope, role, dealer, notify=False)
+
+    @r.callback_query(F.data.startswith("kF:"))
+    async def cb_delete_force(cb: CallbackQuery, db: DB, bot: Bot, role: str, dealer):
+        cid, _, scope = parse(cb, role, dealer)
+        c = db.get(cid)
+        if not can_manage(role, dealer, c):
+            return await cb.answer("Ключ не найден", show_alert=True)
+        await cb.answer("Удалено")
+        await finish_delete(cb, db, bot, c, scope, role, dealer, notify=True)
+
+    @r.callback_query(F.data.startswith("kx:"))
+    async def cb_purge_ask(cb: CallbackQuery, db: DB, role: str, dealer):
+        scope, did = resolve_scope(role, dealer, cb.data[3:])
+        n = sum(1 for c in db.list_all(did) if c["status"] != "active")
+        await cb.answer()
+        await show(cb, screen(f"🧹 Удалить отключённые ключи ({n})?",
+                              "Отключённые и истёкшие ключи исчезнут из списка. Активные ключи не затрагиваются."),
+                   ikb([("🧹 Удалить", f"kX:{scope}"), ("✖️ Отмена", f"kp:0:{scope}")]))
+
+    @r.callback_query(F.data.startswith("kX:"))
+    async def cb_purge(cb: CallbackQuery, db: DB, role: str, dealer):
+        scope, did = resolve_scope(role, dealer, cb.data[3:])
+        n = db.delete_revoked(did)
+        await cb.answer("Готово")
+        await show(cb, *keys_screen(db, 0, scope, did, role == "admin", top=f"🧹 Удалено отключённых ключей: {n}"))
+
     # ---------- поддержка: ответ клиенту ----------
     def can_reply(db: DB, role: str, dealer, client_uid: int) -> bool:
-        return role == "admin" or any(c["dealer_id"] == dealer["id"] for c in db.clients_of(client_uid))
+        return role == "admin"   # поддержка — только главный админ
 
     @r.callback_query(F.data.startswith("rep:"))
     async def cb_reply(cb: CallbackQuery, state: FSMContext, db: DB, role: str, dealer):
@@ -1114,11 +1186,8 @@ def build_client_router(cfg: Config) -> Router:
         await show(cb, screen("📲 Как подключиться", texts.HOWTO, hint=texts.HOWTO_HINT), ikb(nav()))
 
     def support_targets(db: DB, uid: int) -> tuple[list[int], Optional[str]]:
-        """Кому идёт вопрос клиента: диллеру его ключа, иначе главным админам. → (кому, @username)."""
-        for c in db.clients_of(uid):
-            d = db.dealer(c["dealer_id"])
-            if d and d["active"] and d["tg_id"]:
-                return [d["tg_id"]], d["tg_username"]
+        """Вопросы клиентов (в том числе клиентов диллеров) всегда идут главному админу.
+        → (кому, @username для кнопки «Открыть чат» — из SUPPORT_CONTACT, если там не числовой ID)."""
         contact = cfg.support_contact.lstrip("@") if cfg.support_contact and not cfg.support_contact.lstrip("@").isdigit() else None
         return list(cfg.admin_ids), contact
 
