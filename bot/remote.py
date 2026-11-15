@@ -177,27 +177,119 @@ def public_key_line(key: asyncssh.SSHKey) -> str:
     return key.export_public_key().decode().strip()
 
 
-async def bootstrap_ssh(host: str, port: int, user: str, password: str, pubkey: str) -> str:
-    """Заходит по паролю, добавляет ключ бота в authorized_keys. Возвращает ключ сервера."""
+# ======================= первый вход на сервер =======================
+class KeyNeedsPassphrase(RemoteError):
+    """SSH-ключ защищён паролем (passphrase) — нужно спросить его."""
+
+
+# пользователи, под которыми облака пускают по ключу (AWS, Google Cloud, Azure, Oracle…)
+CLOUD_USERS = ("root", "ubuntu", "ec2-user", "admin", "debian", "centos", "rocky", "almalinux", "opc", "azureuser")
+
+
+def looks_like_key(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith("-----BEGIN") or t.startswith("PuTTY-User-Key-File")
+
+
+def load_user_key(data: bytes, passphrase: Optional[str] = None) -> asyncssh.SSHKey:
+    """Приватный SSH-ключ пользователя (OpenSSH, PEM от AWS, PKCS#8). Понятные ошибки на русском."""
     try:
-        conn = await asyncio.wait_for(asyncssh.connect(
-            host, port=port, username=user, password=password,
-            known_hosts=None, client_keys=None, agent_path=None,
-        ), 25)
+        return asyncssh.import_private_key(data, passphrase or None)
+    except asyncssh.KeyEncryptionError:
+        raise RemoteError("Неверный пароль от ключа (passphrase)")
+    except (asyncssh.KeyImportError, ValueError, TypeError) as e:
+        text = str(e)
+        if "Passphrase must be specified" in text:
+            raise KeyNeedsPassphrase("Ключ защищён паролем (passphrase)")
+        if passphrase and ("decrypt" in text.lower() or "passphrase" in text.lower()):
+            raise RemoteError("Неверный пароль от ключа (passphrase)")
+        raise RemoteError("Не удалось прочитать ключ. Нужен приватный ключ: файл .pem (AWS) "
+                          "или id_rsa / id_ed25519, начинается с «-----BEGIN»")
+
+
+# Даёт боту вход под root по его ключу. Выполняется от root (напрямую или через sudo).
+_ROOT_SETUP = r"""
+set -e
+umask 077
+mkdir -p /root/.ssh && touch /root/.ssh/authorized_keys
+grep -qxF {key} /root/.ssh/authorized_keys || echo {key} >> /root/.ssh/authorized_keys
+chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+# root по ключу запрещён (бывает на облаках) — разрешаем ТОЛЬКО по ключу, вход по паролю не включаем
+if sshd -T 2>/dev/null | grep -qix 'permitrootlogin no'; then
+  if grep -qi '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config; then
+    mkdir -p /etc/ssh/sshd_config.d
+    echo 'PermitRootLogin prohibit-password' > /etc/ssh/sshd_config.d/00-vpnbot.conf
+  else
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/I' /etc/ssh/sshd_config
+    grep -qi '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
+  fi
+  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null || true
+fi
+"""
+
+
+async def bootstrap_ssh(host: str, port: int, user: str, bot_key: asyncssh.SSHKey,
+                        password: Optional[str] = None, user_key: Optional[asyncssh.SSHKey] = None,
+                        try_users: bool = False) -> str:
+    """Первый вход на сервер по паролю ИЛИ по SSH-ключу пользователя.
+
+    Бот добавляет СВОЙ ключ для root и дальше ходит только по нему — пароль и ключ пользователя
+    нигде не сохраняются. Если вход не под root (например ubuntu на AWS) — настраивает root через sudo.
+    try_users: пользователь не указан явно — пробуем root, ubuntu, ec2-user… по очереди.
+    → ключ сервера (host key).
+    """
+    users = [user] + ([u for u in CLOUD_USERS if u != user] if try_users else [])
+    tried = []
+    conn = None
+    for u in users:
+        try:
+            conn = await asyncio.wait_for(asyncssh.connect(
+                host, port=port, username=u, password=password if user_key is None else None,
+                client_keys=[user_key] if user_key is not None else None,
+                known_hosts=None, agent_path=None,
+            ), 25)
+            user = u
+            break
+        except asyncssh.PermissionDenied:
+            tried.append(u)
+        except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
+            raise conn_error(host, port, e)
+    if conn is None:
+        who = ", ".join(tried)
+        if user_key is not None:
+            raise RemoteError(f"Сервер не принял этот ключ (пробовал пользователей: {who}). "
+                              "Проверьте, что это ключ от этого сервера")
+        raise RemoteError("Неверный пароль — или на сервере запрещён вход по паролю")
+
+    pubkey = public_key_line(bot_key)
+    async with conn:
+        host_key = conn.get_server_host_key().export_public_key().decode().strip()
+        script = _ROOT_SETUP.format(key=shlex.quote(pubkey))
+        r = await conn.run("id -u", stdin=asyncssh.DEVNULL)
+        if str(r.stdout).strip() == "0":
+            r = await conn.run(f"bash -c {shlex.quote(script)}", stdin=asyncssh.DEVNULL)
+        elif password and user_key is None:   # sudo спросит пароль пользователя
+            r = await conn.run(f"sudo -S -p '' bash -c {shlex.quote(script)}", input=password + "\n")
+        else:
+            r = await conn.run(f"sudo -n bash -c {shlex.quote(script)}", stdin=asyncssh.DEVNULL)
+        if r.exit_status:
+            err = str(r.stderr or r.stdout or "").strip()
+            if "sudo" in err.lower() or "password" in err.lower():
+                raise RemoteError(f"У пользователя {user} нет прав sudo — нужен root или пользователь с sudo")
+            raise RemoteError(f"Не удалось настроить доступ: {err[-300:]}")
+
+    # проверка: бот входит под root по своему ключу
+    try:
+        check = await asyncio.wait_for(asyncssh.connect(
+            host, port=port, username="root", client_keys=[bot_key], password=None,
+            known_hosts=None, agent_path=None), 25)
+        async with check:
+            r = await check.run("id -u", stdin=asyncssh.DEVNULL)
+            if str(r.stdout).strip() != "0":
+                raise RemoteError("Вход под root не работает")
     except asyncssh.PermissionDenied:
-        raise RemoteError("Неверный пароль — или на сервере запрещён вход root по паролю")
+        raise RemoteError("Ключ бота добавлен, но сервер не пускает root по ключу. "
+                          "Проверьте PermitRootLogin в /etc/ssh/sshd_config")
     except (OSError, asyncssh.Error, asyncio.TimeoutError) as e:
         raise conn_error(host, port, e)
-    async with conn:
-        r = await conn.run("id -u", stdin=asyncssh.DEVNULL)
-        if str(r.stdout).strip() != "0":
-            raise RemoteError("Нужен пользователь root (у этого пользователя нет прав root).")
-        q = shlex.quote(pubkey)
-        r = await conn.run(
-            "umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && "
-            f"(grep -qxF {q} ~/.ssh/authorized_keys || echo {q} >> ~/.ssh/authorized_keys)",
-            stdin=asyncssh.DEVNULL,
-        )
-        if r.exit_status:
-            raise RemoteError(f"Не удалось добавить ключ: {r.stderr or r.stdout}")
-        return conn.get_server_host_key().export_public_key().decode().strip()
+    return host_key

@@ -27,7 +27,8 @@ from . import engine, services, texts
 from .config import Config
 from .db import DB
 from .engine import ERRORS, NAME_RE, Fleet, is_valid_host
-from .remote import RemoteAuthError, RemoteError, RemoteHostKeyError, bootstrap_ssh
+from .remote import (KeyNeedsPassphrase, RemoteAuthError, RemoteError, RemoteHostKeyError, bootstrap_ssh,
+                     load_user_key, looks_like_key)
 from .ui import (BTN_HOME, CANCEL, Live, fields, greet, ikb, nav, open_panel, pairs, screen, show)
 
 esc = html.escape
@@ -52,12 +53,14 @@ class NewKey(StatesGroup):
 class AddServer(StatesGroup):
     name = State()
     host = State()
-    password = State()
+    password = State()      # пароль ИЛИ SSH-ключ
+    passphrase = State()    # пароль от SSH-ключа
 
 
 class ChangeIP(StatesGroup):
     host = State()
     password = State()
+    passphrase = State()
 
 
 class Broadcast(StatesGroup):
@@ -79,6 +82,31 @@ class SupportMsg(StatesGroup):
 
 class SupportReply(StatesGroup):
     text = State()
+
+
+# ======================= пароль или SSH-ключ =======================
+SECRET_HINT = ("<i>🔒 Бот войдёт один раз, добавит свой ключ и сразу удалит ваше сообщение. "
+               "Пароль и ключ нигде не сохраняются.</i>")
+PASSPHRASE_Q = "🔑 Ключ защищён паролем. Напишите <b>пароль от ключа</b> (passphrase)."
+
+
+def secret_question(user: str) -> str:
+    return (f"Напишите <b>пароль {esc(user)}</b> от сервера\n"
+            "или пришлите <b>SSH-ключ</b> — файлом (.pem от AWS, id_rsa…) или текстом.\n" + SECRET_HINT)
+
+
+async def read_secret(m: Message) -> tuple[Optional[str], Optional[bytes], str]:
+    """Пароль или приватный SSH-ключ из сообщения. → (пароль, ключ, ошибка)."""
+    if m.document:
+        if (m.document.file_size or 0) > 64 * 1024:
+            return None, None, "Файл слишком большой — это не SSH-ключ"
+        return None, (await m.bot.download(m.document)).read(), ""
+    text = m.text or ""
+    if looks_like_key(text):
+        return None, text.strip().encode() + b"\n", ""
+    if not text.strip():
+        return None, None, "Пришлите пароль текстом или SSH-ключ файлом"
+    return text, None, ""
 
 
 # ======================= роли =======================
@@ -441,7 +469,7 @@ def build_admin_router(cfg: Config) -> Router:
         done = fields(("Название", esc(data["name"]) if data.get("name") else None),
                       ("IP", f"{data['host']}:{data['port']}" if data.get("host") else None))
         return screen(f"🖥 Новый сервер · шаг {step} из 3", done or None, question,
-                      f"⚠️ {error}" if error else None), ikb(CANCEL)
+                      f"⚠️ {esc(error)}" if error else None), ikb(CANCEL)
 
     @r.callback_query(F.data == "sa")
     async def cb_add(cb: CallbackQuery, state: FSMContext):
@@ -464,24 +492,55 @@ def build_admin_router(cfg: Config) -> Router:
             return await show(m, *add_server_screen(2, "Напишите <b>IP сервера</b>, например <code>1.2.3.4</code>",
                                                     data, "Это не похоже на IP-адрес"))
         user = match["user"] or "root"
-        await state.update_data(host=match["host"], port=int(match["port"] or 22), user=user)
+        # пользователь не указан — с ключом бот сам попробует root, ubuntu, ec2-user…
+        await state.update_data(host=match["host"], port=int(match["port"] or 22), user=user,
+                                user_auto=match["user"] is None)
         await state.set_state(AddServer.password)
-        await show(m, *add_server_screen(3, f"Напишите <b>пароль {user}</b> от сервера.\n"
-                                            "<i>🔒 Бот зайдёт один раз, добавит свой ключ и сразу удалит сообщение "
-                                            "с паролем. Пароль нигде не сохраняется.</i>", await state.get_data()))
+        await show(m, *add_server_screen(3, secret_question(user), await state.get_data()))
 
-    @r.message(AddServer.password, F.text)
-    async def add_password(m: Message, state: FSMContext, db: DB, fleet: Fleet):
-        password = m.text
+    @r.message(AddServer.password)
+    async def add_secret(m: Message, state: FSMContext, db: DB, fleet: Fleet):
         data = await state.get_data()
-        panel = await show(m, *add_server_screen(3, f"⏳ Подключаюсь к <b>{data['host']}</b>…", data))
+        password, key_data, error = await read_secret(m)
+        if error:
+            return await show(m, *add_server_screen(3, secret_question(data["user"]), data, error))
+        user_key = None
+        if key_data is not None:
+            try:
+                user_key = load_user_key(key_data)
+            except KeyNeedsPassphrase:
+                await state.update_data(key=key_data.hex())
+                await state.set_state(AddServer.passphrase)
+                return await show(m, *add_server_screen(3, PASSPHRASE_Q, data))
+            except RemoteError as e:
+                return await show(m, *add_server_screen(3, secret_question(data["user"]), data, str(e)))
+        await connect_new_server(m, state, db, fleet, password, user_key)
+
+    @r.message(AddServer.passphrase, F.text)
+    async def add_passphrase(m: Message, state: FSMContext, db: DB, fleet: Fleet):
+        data = await state.get_data()
         try:
-            host_key = await bootstrap_ssh(data["host"], data["port"], data["user"], password, fleet.pubkey)
+            user_key = load_user_key(bytes.fromhex(data["key"]), m.text)
         except RemoteError as e:
-            text, kb = add_server_screen(3, f"Напишите <b>пароль {data['user']}</b> ещё раз.", data, str(e))
+            return await show(m, *add_server_screen(3, PASSPHRASE_Q, data, str(e)))
+        await connect_new_server(m, state, db, fleet, None, user_key)
+
+    async def connect_new_server(m: Message, state: FSMContext, db: DB, fleet: Fleet, password, user_key):
+        data = await state.get_data()
+        how = "по SSH-ключу" if user_key is not None else "по паролю"
+        panel = await show(m, *add_server_screen(3, f"⏳ Подключаюсь к <b>{data['host']}</b> {how}…", data))
+        try:
+            host_key = await bootstrap_ssh(data["host"], data["port"], data["user"], fleet.client_key,
+                                           password=password, user_key=user_key,
+                                           try_users=user_key is not None and data.get("user_auto", True))
+        except RemoteError as e:
+            await state.set_state(AddServer.password)
+            await state.update_data(key=None)
+            text, kb = add_server_screen(3, secret_question(data["user"]), data, str(e))
             return await panel.edit_text(text, reply_markup=kb)
         await state.clear()
-        sid = db.add_server(data["name"], "ssh", data["host"], data["port"], data["user"], host_key)
+        # дальше бот всегда ходит под root по своему ключу (вход под ubuntu и т.п. — только для настройки)
+        sid = db.add_server(data["name"], "ssh", data["host"], data["port"], "root", host_key)
         text, kb = await server_screen(db, fleet, sid, top="✅ Сервер добавлен")
         await panel.edit_text(text, reply_markup=kb)
 
@@ -533,8 +592,7 @@ def build_admin_router(cfg: Config) -> Router:
         return screen(f"🔐 Смена IP · {esc(server['name'])}",
                       fields(("Новый IP", host)),
                       f"⚠️ {esc(reason)}.",
-                      f"Напишите <b>пароль {server['user']}</b> от сервера на новом IP — бот подключится заново.\n"
-                      "<i>🔒 Сообщение с паролем сразу удалится, пароль не сохраняется.</i>",
+                      "Бот подключится к новому IP заново.\n" + secret_question(server["user"]),
                       f"❌ {esc(error)}" if error else None,
                       hint="На AWS при смене IP часто создаётся новый сервер — поэтому бот не может войти по старому ключу"), \
             ikb(nav(f"s:{server['id']}"))
@@ -570,16 +628,48 @@ def build_admin_router(cfg: Config) -> Router:
         await state.clear()
         await after_switch(panel, db, fleet, bot, sid, old)
 
-    @r.message(ChangeIP.password, F.text)
-    async def change_ip_password(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot):
+    @r.message(ChangeIP.password)
+    async def change_ip_secret(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot):
+        data = await state.get_data()
+        server = db.server(data["sid"])
+        password, key_data, error = await read_secret(m)
+        if error:
+            return await show(m, *password_screen(server, data["new_host"], data["reason"], error))
+        user_key = None
+        if key_data is not None:
+            try:
+                user_key = load_user_key(key_data)
+            except KeyNeedsPassphrase:
+                await state.update_data(key=key_data.hex())
+                await state.set_state(ChangeIP.passphrase)
+                return await show(m, screen(f"🔐 Смена IP · {esc(server['name'])}", PASSPHRASE_Q),
+                                  ikb(nav(f"s:{server['id']}")))
+            except RemoteError as e:
+                return await show(m, *password_screen(server, data["new_host"], data["reason"], str(e)))
+        await reconnect_new_ip(m, state, db, fleet, bot, password, user_key)
+
+    @r.message(ChangeIP.passphrase, F.text)
+    async def change_ip_passphrase(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot):
+        data = await state.get_data()
+        server = db.server(data["sid"])
+        try:
+            user_key = load_user_key(bytes.fromhex(data["key"]), m.text)
+        except RemoteError as e:
+            return await show(m, screen(f"🔐 Смена IP · {esc(server['name'])}", PASSPHRASE_Q, f"⚠️ {esc(str(e))}"),
+                              ikb(nav(f"s:{server['id']}")))
+        await reconnect_new_ip(m, state, db, fleet, bot, None, user_key)
+
+    async def reconnect_new_ip(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot, password, user_key):
         data = await state.get_data()
         sid, host = data["sid"], data["new_host"]
         server = db.server(sid)
         panel = await show(m, screen(f"🔐 Смена IP · {esc(server['name'])}", f"⏳ Подключаюсь к <b>{esc(host)}</b>…"))
         try:
-            host_key = await bootstrap_ssh(host, server["port"], server["user"], m.text, fleet.pubkey)
+            host_key = await bootstrap_ssh(host, server["port"], "root", fleet.client_key, password=password,
+                                           user_key=user_key, try_users=user_key is not None)
             old = await services.switch_host(db, fleet, sid, host, host_key)
         except RemoteError as e:
+            await state.set_state(ChangeIP.password)
             text, kb = password_screen(server, host, data["reason"], str(e))
             return await panel.edit_text(text, reply_markup=kb)
         await state.clear()
