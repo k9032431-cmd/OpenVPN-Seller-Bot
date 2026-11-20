@@ -391,3 +391,26 @@ class DB:
             else:
                 cur = self.conn.execute("DELETE FROM clients WHERE status='revoked' AND dealer_id=?", (dealer_id,))
         return cur.rowcount
+
+    # ---------- пользователи (клиенты, открывшие ссылку) ----------
+    def users(self, dealer_id: Optional[int] = None) -> list[sqlite3.Row]:
+        """Telegram-пользователи с ключами: tg_id, username, keys, active. dealer_id — только клиенты диллера."""
+        where, args = ("AND dealer_id=?", (dealer_id,)) if dealer_id is not None else ("", ())
+        return self.conn.execute(
+            "SELECT tg_id, MAX(tg_username) AS username, COUNT(*) AS keys, SUM(status='active') AS active,"
+            " MAX(created_at) AS last FROM clients WHERE tg_id IS NOT NULL " + where +
+            " GROUP BY tg_id ORDER BY last DESC", args).fetchall()
+
+    def user_keys(self, tg_id: int, dealer_id: Optional[int] = None) -> list[sqlite3.Row]:
+        if dealer_id is None:
+            return self.conn.execute("SELECT * FROM clients WHERE tg_id=? ORDER BY status, created_at",
+                                     (tg_id,)).fetchall()
+        return self.conn.execute("SELECT * FROM clients WHERE tg_id=? AND dealer_id=? ORDER BY status, created_at",
+                                 (tg_id, dealer_id)).fetchall()
+
+    def reactivate(self, cid: int, name: str, value: bytes, filename: Optional[str], days: int) -> None:
+        """Возобновить отключённый ключ: новый файл, новый срок, привязка к клиенту/диллеру сохраняется."""
+        expires = int(time.time()) + days * DAY if days > 0 else None
+        with self.conn:
+            self.conn.execute("UPDATE clients SET name=?, value=?, filename=?, status='active', expires_at=?, warned=0"
+                              " WHERE id=?", (name, value, filename, expires, cid))

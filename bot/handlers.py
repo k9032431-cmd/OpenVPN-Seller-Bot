@@ -176,14 +176,16 @@ def home_screen(cfg: Config, db: DB, uid: int):
                           f"{mark(servers)} 2. Добавить сервер — «🖥 Серверы»\n"
                           f"{mark(db.list_all())} 3. Создать первый ключ — «➕ Новый ключ»")
         kb = ikb([(texts.BTN_NEW, "new")],
-                 [(texts.BTN_KEYS, "kp:0:a"), (texts.BTN_SERVERS, "sl")],
-                 [(texts.BTN_SCRIPTS, "sc:list"), (texts.BTN_DEALERS, "dls")],
-                 [(texts.BTN_BCAST, "bc"), (texts.BTN_HELP, "help")])
+                 [(texts.BTN_KEYS, "kp:0:a"), (texts.BTN_USERS, "ul:0:a")],
+                 [(texts.BTN_SERVERS, "sl"), (texts.BTN_SCRIPTS, "sc:list")],
+                 [(texts.BTN_DEALERS, "dls"), (texts.BTN_BCAST, "bc")],
+                 [(texts.BTN_HELP, "help")])
         return screen("🏠 Главное меню", *blocks, hint="Выберите раздел"), kb
     if role == "dealer":
         active, total = db.dealer_counts(dealer["id"])
         kb = ikb([(texts.BTN_NEW, "new")],
-                 [(texts.BTN_MY_KEYS, f"kp:0:d{dealer['id']}"), (texts.BTN_HELP, "help")])
+                 [(texts.BTN_MY_KEYS, f"kp:0:d{dealer['id']}"), (texts.BTN_MY_USERS, f"ul:0:d{dealer['id']}")],
+                 [(texts.BTN_HELP, "help")])
         return screen("🏠 Главное меню",
                       fields(("👤 Диллер", esc(dealer["name"])), ("🔑 Активных ключей", limit_text(db, dealer)),
                              ("📦 Всего ключей", total)),
@@ -269,13 +271,58 @@ def key_screen(db: DB, c, bot_username: str, scope: str, admin_view: bool, top: 
     i = c["id"]
     back = nav(f"kp:0:{scope}")
     if c["status"] != "active":
-        return screen(f"🔑 {c['name']}", top, info), ikb([("🗑 Удалить ключ", f"kd:{i}:{scope}")], back)
+        renew = [("♻️ 30 дней", f"kn:{i}:30:{scope}"), ("♻️ 90 дней", f"kn:{i}:90:{scope}"),
+                 ("♻️ Бессрочно", f"kn:{i}:0:{scope}")]
+        return screen(f"🔑 {c['name']}", top, info,
+                      "<b>♻️ Возобновить ключ</b>\nБот создаст ключ на сервере заново и сам отправит клиенту новый файл."), \
+            ikb(renew, [("🗑 Удалить ключ", f"kd:{i}:{scope}")], back)
     kb = ikb([("📄 Файл ключа", f"kf:{i}"), ("🔗 Новая ссылка", f"kl:{i}:{scope}")],
              [("+30 дней", f"ke:{i}:30:{scope}"), ("+90 дней", f"ke:{i}:90:{scope}"), ("♾ Бессрочно", f"ke:{i}:0:{scope}")],
              [("⛔ Отключить", f"kr:{i}:{scope}"), ("🗑 Удалить", f"kd:{i}:{scope}")],
              back)
     hint = "Перешлите ссылку клиенту — он нажмёт «Запустить» и получит ключ" if link else ""
     return screen(f"🔑 {c['name']}", top, info, link, hint=hint), kb
+
+
+# ======================= пользователи (клиенты) =======================
+def user_label(row) -> str:
+    return f"@{esc(row['username'])}" if row["username"] else f"ID {row['tg_id']}"
+
+
+def users_screen(db: DB, page: int, scope: str, dealer_id: Optional[int], admin_view: bool, top: str = ""):
+    rows = db.users(dealer_id)
+    pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    buttons = []
+    for u in rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
+        icon = "🟢" if u["active"] else "🔴"
+        label = f"@{u['username']}" if u["username"] else f"ID {u['tg_id']}"
+        buttons.append([(f"{icon} {label} · 🔑 {u['active']}/{u['keys']}", f"u:{u['tg_id']}:{scope}")])
+    if pages > 1:
+        buttons.append([("◀️", f"ul:{page - 1}:{scope}"), (f"{page + 1} / {pages}", "noop"),
+                        ("▶️", f"ul:{page + 1}:{scope}")])
+    buttons.append(nav())
+    title = "👤 Пользователи" if admin_view else "👤 Мои клиенты"
+    if not rows:
+        return screen(title, top, "Пока никто не открыл ссылку на ключ.",
+                      hint="Пользователь появится здесь, когда откроет ссылку и получит ключ"), ikb(*buttons)
+    return screen(title, top, fields(("Всего", len(rows)), ("С активным ключом", sum(1 for u in rows if u["active"]))),
+                  hint="🟢 есть активный ключ · 🔴 все ключи отключены · 🔑 активных/всего"), ikb(*buttons)
+
+
+def user_screen(db: DB, tg_id: int, scope: str, dealer_id: Optional[int], admin_view: bool, top: str = ""):
+    keys = db.user_keys(tg_id, dealer_id)
+    if not keys:
+        return screen("👤 Пользователь не найден", top), ikb(nav(f"ul:0:{scope}"))
+    username = next((k["tg_username"] for k in keys if k["tg_username"]), None)
+    info = fields(("Telegram", f"@{esc(username)}" if username else "без username"), ("ID", tg_id),
+                  ("Ключей", f"{sum(1 for k in keys if k['status'] == 'active')} активных из {len(keys)}"))
+    rows = [[(f"{'🟢' if k['status'] == 'active' else '🔴'} {k['name']} · {short_date(k['expires_at'])}",
+              f"k:{k['id']}:{scope}")] for k in keys]
+    rows.append([("🗑 Удалить пользователя", f"ud:{tg_id}:{scope}")])
+    rows.append(nav(f"ul:0:{scope}"))
+    return screen(f"👤 {f'@{esc(username)}' if username else f'ID {tg_id}'}", top, info,
+                  hint="Нажмите на ключ, чтобы открыть его"), ikb(*rows)
 
 
 # ======================= серверы =======================
@@ -1139,6 +1186,96 @@ def build_staff_router(cfg: Config) -> Router:
         n = db.delete_revoked(did)
         await cb.answer("Готово")
         await show(cb, *keys_screen(db, 0, scope, did, role == "admin", top=f"🧹 Удалено отключённых ключей: {n}"))
+
+    # ---------- возобновить отключённый ключ ----------
+    @r.callback_query(F.data.startswith("kn:"))
+    async def cb_renew(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot, bot_username: str, role: str, dealer):
+        cid, args, scope = parse(cb, role, dealer)
+        c = db.get(cid)
+        if not can_manage(role, dealer, c) or c["status"] == "active":
+            return await cb.answer("Ключ не найден или уже активен", show_alert=True)
+        if role == "dealer" and db.dealer_slots_left(dealer["id"]) == 0:
+            active, _ = db.dealer_counts(dealer["id"])
+            return await cb.answer(f"Лимит ключей исчерпан: {active} из {dealer['key_limit']}", show_alert=True)
+        if c["server_id"] in fleet.busy:
+            return await cb.answer("На сервере сейчас идёт операция, попробуйте через минуту", show_alert=True)
+        await cb.answer("Возобновляю…")
+        header = screen(f"♻️ Возобновление ключа {c['name']}", fields(("Сервер", name_of(db.server(c["server_id"])))))
+        panel = await show(cb, header)
+        live = Live(panel, header)
+        await live("⏳ Подключение к серверу…")
+        fleet.busy.add(c["server_id"])
+        try:
+            name = await services.renew_key(bot, db, fleet, cid, int(args[0]), live,
+                                            dealer_text=texts.DEALER_RENEWED if role == "admin" and c["dealer_id"] else None)
+        except (*ERRORS, KeyError) as e:
+            return await live.fail(str(e), getattr(e, "output", "") if role == "admin" else "",
+                                   ikb([("🔄 Повторить", cb.data)], nav(f"k:{cid}:{scope}")))
+        finally:
+            fleet.busy.discard(c["server_id"])
+        top = "✅ Ключ снова активен" + ("" if name == c["name"] else f" (новое имя: {name})")
+        top += " — клиенту отправлен новый файл" if c["tg_id"] else ""
+        await show_key(cb, db, cid, scope, bot_username, role, dealer, top=top)
+
+    # ---------- пользователи ----------
+    @r.callback_query(F.data.startswith("ul:"))
+    async def cb_users(cb: CallbackQuery, state: FSMContext, db: DB, role: str, dealer):
+        await state.clear()
+        _, page, requested = (cb.data.split(":") + ["a"])[:3]
+        scope, did = resolve_scope(role, dealer, requested)
+        await cb.answer()
+        await show(cb, *users_screen(db, int(page), scope, did, role == "admin"))
+
+    def parse_user(cb: CallbackQuery, role: str, dealer) -> tuple[int, str, Optional[int]]:
+        _, tg, requested = (cb.data.split(":") + ["a"])[:3]
+        scope, did = resolve_scope(role, dealer, requested)
+        return int(tg), scope, did
+
+    @r.callback_query(F.data.startswith("u:"))
+    async def cb_user(cb: CallbackQuery, db: DB, role: str, dealer):
+        tg, scope, did = parse_user(cb, role, dealer)
+        await cb.answer()
+        await show(cb, *user_screen(db, tg, scope, did, role == "admin"))
+
+    @r.callback_query(F.data.startswith("ud:"))
+    async def cb_user_delete_ask(cb: CallbackQuery, db: DB, role: str, dealer):
+        tg, scope, did = parse_user(cb, role, dealer)
+        keys = db.user_keys(tg, did)
+        if not keys:
+            return await cb.answer("Пользователь не найден", show_alert=True)
+        active = sum(1 for k in keys if k["status"] == "active")
+        await cb.answer()
+        await show(cb, screen("🗑 Удалить пользователя?",
+                              fields(("Пользователь", user_label({"username": keys[0]["tg_username"], "tg_id": tg})),
+                                     ("Ключей", len(keys)), ("Из них активных", active)),
+                              "Бот удалит все его ключи на сервере и в боте — клиент больше не сможет подключиться.",
+                              hint="Это нельзя отменить"),
+                   ikb([("🗑 Удалить", f"uD:{tg}:{scope}"), ("✖️ Отмена", f"u:{tg}:{scope}")]))
+
+    async def do_delete_user(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot, role: str, dealer, force: bool):
+        tg, scope, did = parse_user(cb, role, dealer)
+        await cb.answer("Удаляю…")
+        label = user_label({"username": next((k["tg_username"] for k in db.user_keys(tg, did) if k["tg_username"]), None),
+                            "tg_id": tg})
+        why = "удалил администратор" if role == "admin" else None
+        failed = await services.delete_user(bot, db, fleet, tg, did, force=force, dealer_why=why)
+        if failed:
+            return await show(cb, screen(f"🗑 Пользователь {label}",
+                                         f"⚠️ Не удалось удалить на сервере ключи: <b>{esc(', '.join(failed))}</b> — "
+                                         "сервер недоступен. Остальное удалено.",
+                                         hint="Можно удалить их только из бота — на сервере они останутся рабочими, "
+                                              "пока сервер недоступен"),
+                              ikb([("🔄 Повторить", f"uD:{tg}:{scope}")],
+                                  [("🗑 Удалить только из бота", f"uF:{tg}:{scope}")], nav(f"ul:0:{scope}")))
+        await show(cb, *users_screen(db, 0, scope, did, role == "admin", top=f"🗑 Пользователь {label} удалён"))
+
+    @r.callback_query(F.data.startswith("uD:"))
+    async def cb_user_delete(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot, role: str, dealer):
+        await do_delete_user(cb, db, fleet, bot, role, dealer, force=False)
+
+    @r.callback_query(F.data.startswith("uF:"))
+    async def cb_user_delete_force(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot, role: str, dealer):
+        await do_delete_user(cb, db, fleet, bot, role, dealer, force=True)
 
     # ---------- поддержка: ответ клиенту ----------
     def can_reply(db: DB, role: str, dealer, client_uid: int) -> bool:

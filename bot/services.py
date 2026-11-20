@@ -247,6 +247,63 @@ async def revoke(bot: Bot, db: DB, fleet: Fleet, cid: int, user_text: Optional[s
         await tell_dealer(bot, db, c, texts.DEALER_KEY_OFF.format(name=c["name"], why=dealer_why))
 
 
+async def renew_key(bot: Bot, db: DB, fleet: Fleet, cid: int, days: int, progress: Progress = _noop,
+                    dealer_text: Optional[str] = None) -> str:
+    """Возобновить отключённый/истёкший ключ: создать его на сервере заново и отправить клиенту.
+
+    Старое имя могло остаться на сервере как отозванное (OpenVPN-скрипт не даёт создать такое же) —
+    тогда пробуем имя-2, имя-3… → имя нового ключа.
+    """
+    c = db.get(cid)
+    server = db.server(c["server_id"])
+    script = db.script(c["script_id"]) or next(iter(db.scripts(only_enabled=True)), None)
+    if server is None or script is None:
+        raise engine.EngineError("Сервер или скрипт этого ключа удалён — создайте новый ключ")
+    candidates = [c["name"]] + [f"{c['name'][:28]}-{n}" for n in range(2, 7)]
+    last: Exception = engine.EngineError("Не удалось создать ключ")
+    for name in candidates:
+        if name != c["name"] and db.name_taken(server["id"], name):
+            continue
+        try:
+            value, filename = await engine.create_key(fleet, db, server, script, name, progress)
+            break
+        except RemoteError as e:
+            if "Файл не найден" not in str(e):   # нет связи и т.п. — другое имя не поможет
+                raise
+            last = e
+            await progress(f"↪️ Имя {name} уже занято на сервере — пробую другое")
+        except engine.EngineError as e:
+            last = e
+            await progress(f"↪️ Имя {name} не подошло — пробую другое")
+    else:
+        raise last
+    db.reactivate(cid, name, value, filename, days)
+    fresh = db.get(cid)
+    if fresh["tg_id"]:
+        await send_key(bot, fresh["tg_id"], fresh, texts.RENEWED_USER)
+    if dealer_text:
+        await tell_dealer(bot, db, fresh, dealer_text.format(name=name, until=fmt_until(fresh["expires_at"])))
+    return name
+
+
+async def delete_user(bot: Bot, db: DB, fleet: Fleet, tg_id: int, dealer_id: Optional[int],
+                      force: bool = False, dealer_why: Optional[str] = None) -> list[str]:
+    """Удалить все ключи пользователя (только ключи диллера, если dealer_id). → ключи, которые не удалось
+    удалить на сервере (без force они остаются в боте)."""
+    failed = []
+    for c in db.user_keys(tg_id, dealer_id):
+        if c["status"] == "active":
+            try:
+                await revoke(bot, db, fleet, c["id"], texts.REVOKED_USER, dealer_why=dealer_why)
+            except (*ERRORS, KeyError):
+                if not force:
+                    failed.append(c["name"])
+                    continue
+                await safe_send(bot, tg_id, texts.REVOKED_USER.format(name=c["name"]))
+        db.delete_client(c["id"])
+    return failed
+
+
 # ---------- фоновые задачи ----------
 async def watch_loop(bot: Bot, db: DB, fleet: Fleet, cfg: Config) -> None:
     """Раз в минуту проверяет, что серверы на связи. Пропал — пишет админу, что делать."""
