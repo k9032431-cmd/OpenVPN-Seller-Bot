@@ -58,12 +58,14 @@ class NewKey(StatesGroup):
 class AddServer(StatesGroup):
     name = State()
     host = State()
+    login = State()         # логин для входа (root, ubuntu, ec2-user…)
     password = State()      # пароль ИЛИ SSH-ключ
     passphrase = State()    # пароль от SSH-ключа
 
 
 class ChangeIP(StatesGroup):
     host = State()
+    login = State()
     password = State()
     passphrase = State()
 
@@ -95,9 +97,34 @@ SECRET_HINT = ("<i>🔒 Бот войдёт один раз, добавит св
 PASSPHRASE_Q = "🔑 Ключ защищён паролем. Напишите <b>пароль от ключа</b> (passphrase)."
 
 
-def secret_question(user: str) -> str:
-    return (f"Напишите <b>пароль {esc(user)}</b> от сервера\n"
+def secret_question(user: str, auto: bool = False) -> str:
+    if auto:
+        return ("Пришлите <b>SSH-ключ</b> — файлом (.pem от AWS, id_rsa…) или текстом: бот сам подберёт логин.\n"
+                "Или напишите <b>пароль root</b>.\n" + SECRET_HINT)
+    return (f"Напишите <b>пароль пользователя {esc(user)}</b>\n"
             "или пришлите <b>SSH-ключ</b> — файлом (.pem от AWS, id_rsa…) или текстом.\n" + SECRET_HINT)
+
+
+LOGIN_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
+LOGIN_Q = ("Под каким <b>логином</b> входить на сервер?\n"
+           "<i>Нажмите кнопку или напишите свой логин. Не root — тоже можно: бот сам получит права через sudo</i>")
+
+
+def login_rows(prefix: str) -> list:
+    """Кнопки выбора логина. prefix — начало callback (al — новый сервер, cl — смена IP)."""
+    return [[("root", f"{prefix}:root"), ("ubuntu", f"{prefix}:ubuntu")],
+            [("ec2-user", f"{prefix}:ec2-user"), ("admin", f"{prefix}:admin")],
+            [("🔍 Не знаю — подобрать по SSH-ключу", f"{prefix}:*")]]
+
+
+def parse_login(value: str) -> tuple[str, bool, str]:
+    """→ (логин, подбирать автоматически, ошибка)."""
+    v = (value or "").strip().lower()
+    if v == "*":
+        return "root", True, ""
+    if not LOGIN_RE.match(v):
+        return "", False, "Логин — латиница, цифры, «_», «-», например ubuntu"
+    return v, False, ""
 
 
 async def read_secret(m: Message) -> tuple[Optional[str], Optional[bytes], str]:
@@ -550,11 +577,18 @@ def build_admin_router(cfg: Config) -> Router:
         await show(cb, *await server_screen(db, fleet, int(cb.data[2:])))
 
     # ---------- добавить сервер ----------
-    def add_server_screen(step: int, question: str, data: dict, error: str = ""):
+    def add_server_screen(step: int, question: str, data: dict, error: str = "", kb_rows=()):
+        login = None
+        if data.get("login_set"):
+            login = "подобрать автоматически" if data.get("user_auto") else esc(data["user"])
         done = fields(("Название", esc(data["name"]) if data.get("name") else None),
-                      ("IP", f"{data['host']}:{data['port']}" if data.get("host") else None))
-        return screen(f"🖥 Новый сервер · шаг {step} из 3", done or None, question,
-                      f"⚠️ {esc(error)}" if error else None), ikb(CANCEL)
+                      ("IP", f"{data['host']}:{data['port']}" if data.get("host") else None),
+                      ("Логин", login))
+        return screen(f"🖥 Новый сервер · шаг {step} из 4", done or None, question,
+                      f"⚠️ {esc(error)}" if error else None), ikb(*kb_rows, CANCEL)
+
+    def secret_step(data: dict, error: str = ""):
+        return add_server_screen(4, secret_question(data["user"], data.get("user_auto", False)), data, error)
 
     @r.callback_query(F.data == "sa")
     async def cb_add(cb: CallbackQuery, state: FSMContext):
@@ -576,19 +610,38 @@ def build_admin_router(cfg: Config) -> Router:
         if not match or not is_valid_host(match["host"]) or int(match["port"] or 22) > 65535:
             return await show(m, *add_server_screen(2, "Напишите <b>IP сервера</b>, например <code>1.2.3.4</code>",
                                                     data, "Это не похоже на IP-адрес"))
-        user = match["user"] or "root"
-        # пользователь не указан — с ключом бот сам попробует root, ubuntu, ec2-user…
-        await state.update_data(host=match["host"], port=int(match["port"] or 22), user=user,
-                                user_auto=match["user"] is None)
+        await state.update_data(host=match["host"], port=int(match["port"] or 22))
+        if match["user"]:   # написали ubuntu@1.2.3.4 — логин уже известен
+            await state.update_data(user=match["user"], user_auto=False, login_set=True)
+            await state.set_state(AddServer.password)
+            return await show(m, *secret_step(await state.get_data()))
+        await state.set_state(AddServer.login)
+        await show(m, *add_server_screen(3, LOGIN_Q, await state.get_data(), kb_rows=login_rows("al")))
+
+    async def set_login(event, state: FSMContext, value: str):
+        user, auto, error = parse_login(value)
+        data = await state.get_data()
+        if error:
+            return await show(event, *add_server_screen(3, LOGIN_Q, data, error, login_rows("al")))
+        await state.update_data(user=user, user_auto=auto, login_set=True)
         await state.set_state(AddServer.password)
-        await show(m, *add_server_screen(3, secret_question(user), await state.get_data()))
+        await show(event, *secret_step(await state.get_data()))
+
+    @r.callback_query(AddServer.login, F.data.startswith("al:"))
+    async def add_login_cb(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        await set_login(cb, state, cb.data[3:])
+
+    @r.message(AddServer.login, F.text)
+    async def add_login_text(m: Message, state: FSMContext):
+        await set_login(m, state, m.text)
 
     @r.message(AddServer.password)
     async def add_secret(m: Message, state: FSMContext, db: DB, fleet: Fleet):
         data = await state.get_data()
         password, key_data, error = await read_secret(m)
         if error:
-            return await show(m, *add_server_screen(3, secret_question(data["user"]), data, error))
+            return await show(m, *secret_step(data, error))
         user_key = None
         if key_data is not None:
             try:
@@ -596,9 +649,11 @@ def build_admin_router(cfg: Config) -> Router:
             except KeyNeedsPassphrase:
                 await state.update_data(key=key_data.hex())
                 await state.set_state(AddServer.passphrase)
-                return await show(m, *add_server_screen(3, PASSPHRASE_Q, data))
+                return await show(m, *add_server_screen(4, PASSPHRASE_Q, data))
             except RemoteError as e:
-                return await show(m, *add_server_screen(3, secret_question(data["user"]), data, str(e)))
+                return await show(m, *secret_step(data, str(e)))
+        if password is not None and data.get("user_auto"):   # пароль — логин подобрать нельзя, берём root
+            await state.update_data(user="root", user_auto=False)
         await connect_new_server(m, state, db, fleet, password, user_key)
 
     @r.message(AddServer.passphrase, F.text)
@@ -607,13 +662,13 @@ def build_admin_router(cfg: Config) -> Router:
         try:
             user_key = load_user_key(bytes.fromhex(data["key"]), m.text)
         except RemoteError as e:
-            return await show(m, *add_server_screen(3, PASSPHRASE_Q, data, str(e)))
+            return await show(m, *add_server_screen(4, PASSPHRASE_Q, data, str(e)))
         await connect_new_server(m, state, db, fleet, None, user_key)
 
     async def connect_new_server(m: Message, state: FSMContext, db: DB, fleet: Fleet, password, user_key):
         data = await state.get_data()
         how = "по SSH-ключу" if user_key is not None else "по паролю"
-        panel = await show(m, *add_server_screen(3, f"⏳ Подключаюсь к <b>{data['host']}</b> {how}…", data))
+        panel = await show(m, *add_server_screen(4, f"⏳ Подключаюсь к <b>{data['host']}</b> {how}…", data))
         try:
             host_key = await bootstrap_ssh(data["host"], data["port"], data["user"], fleet.client_key,
                                            password=password, user_key=user_key,
@@ -621,7 +676,7 @@ def build_admin_router(cfg: Config) -> Router:
         except RemoteError as e:
             await state.set_state(AddServer.password)
             await state.update_data(key=None)
-            text, kb = add_server_screen(3, secret_question(data["user"]), data, str(e))
+            text, kb = secret_step(data, str(e))
             return await panel.edit_text(text, reply_markup=kb)
         await state.clear()
         # дальше бот всегда ходит под root по своему ключу (вход под ubuntu и т.п. — только для настройки)
@@ -673,11 +728,16 @@ def build_admin_router(cfg: Config) -> Router:
                       hint="Бот подключится по новому IP, обновит ключи и сам разошлёт их клиентам и диллерам"), \
             ikb(nav(f"s:{server['id']}"))
 
-    def password_screen(server, host: str, reason: str, error: str = ""):
+    def login_screen(server, host: str, reason: str, error: str = ""):
+        return screen(f"🔐 Смена IP · {esc(server['name'])}", fields(("Новый IP", host)),
+                      f"⚠️ {esc(reason)}.", "Бот подключится к новому IP заново.\n" + LOGIN_Q,
+                      f"❌ {esc(error)}" if error else None), ikb(*login_rows("cl"), nav(f"s:{server['id']}"))
+
+    def password_screen(server, host: str, reason: str, error: str = "", login: str = "root", auto: bool = False):
         return screen(f"🔐 Смена IP · {esc(server['name'])}",
-                      fields(("Новый IP", host)),
+                      fields(("Новый IP", host), ("Логин", "подобрать автоматически" if auto else esc(login))),
                       f"⚠️ {esc(reason)}.",
-                      "Бот подключится к новому IP заново.\n" + secret_question(server["user"]),
+                      "Бот подключится к новому IP заново.\n" + secret_question(login, auto),
                       f"❌ {esc(error)}" if error else None,
                       hint="На AWS при смене IP часто создаётся новый сервер — поэтому бот не может войти по старому ключу"), \
             ikb(nav(f"s:{server['id']}"))
@@ -704,8 +764,8 @@ def build_admin_router(cfg: Config) -> Router:
             old = await services.switch_host(db, fleet, sid, host)
         except (RemoteAuthError, RemoteHostKeyError) as e:  # новый сервер / ключ бота пропал — нужен пароль
             await state.update_data(new_host=host, reason=str(e))
-            await state.set_state(ChangeIP.password)
-            text, kb = password_screen(server, host, str(e))
+            await state.set_state(ChangeIP.login)
+            text, kb = login_screen(server, host, str(e))
             return await panel.edit_text(text, reply_markup=kb)
         except RemoteError as e:                            # не отвечает и т.п. — можно ввести другой IP
             text, kb = ip_screen(server, str(e))
@@ -713,13 +773,33 @@ def build_admin_router(cfg: Config) -> Router:
         await state.clear()
         await after_switch(panel, db, fleet, bot, sid, old)
 
+    async def change_ip_set_login(event, state: FSMContext, db: DB, value: str):
+        data = await state.get_data()
+        server = db.server(data["sid"])
+        login, auto, error = parse_login(value)
+        if error:
+            return await show(event, *login_screen(server, data["new_host"], data["reason"], error))
+        await state.update_data(login=login, login_auto=auto)
+        await state.set_state(ChangeIP.password)
+        await show(event, *password_screen(server, data["new_host"], data["reason"], login=login, auto=auto))
+
+    @r.callback_query(ChangeIP.login, F.data.startswith("cl:"))
+    async def change_ip_login_cb(cb: CallbackQuery, state: FSMContext, db: DB):
+        await cb.answer()
+        await change_ip_set_login(cb, state, db, cb.data[3:])
+
+    @r.message(ChangeIP.login, F.text)
+    async def change_ip_login_text(m: Message, state: FSMContext, db: DB):
+        await change_ip_set_login(m, state, db, m.text)
+
     @r.message(ChangeIP.password)
     async def change_ip_secret(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot):
         data = await state.get_data()
         server = db.server(data["sid"])
         password, key_data, error = await read_secret(m)
         if error:
-            return await show(m, *password_screen(server, data["new_host"], data["reason"], error))
+            return await show(m, *password_screen(server, data["new_host"], data["reason"], error,
+                                                  data.get("login", "root"), data.get("login_auto", False)))
         user_key = None
         if key_data is not None:
             try:
@@ -730,7 +810,8 @@ def build_admin_router(cfg: Config) -> Router:
                 return await show(m, screen(f"🔐 Смена IP · {esc(server['name'])}", PASSPHRASE_Q),
                                   ikb(nav(f"s:{server['id']}")))
             except RemoteError as e:
-                return await show(m, *password_screen(server, data["new_host"], data["reason"], str(e)))
+                return await show(m, *password_screen(server, data["new_host"], data["reason"], str(e),
+                                                      data.get("login", "root"), data.get("login_auto", False)))
         await reconnect_new_ip(m, state, db, fleet, bot, password, user_key)
 
     @r.message(ChangeIP.passphrase, F.text)
@@ -750,12 +831,14 @@ def build_admin_router(cfg: Config) -> Router:
         server = db.server(sid)
         panel = await show(m, screen(f"🔐 Смена IP · {esc(server['name'])}", f"⏳ Подключаюсь к <b>{esc(host)}</b>…"))
         try:
-            host_key = await bootstrap_ssh(host, server["port"], "root", fleet.client_key, password=password,
-                                           user_key=user_key, try_users=user_key is not None)
+            host_key = await bootstrap_ssh(host, server["port"], data.get("login", "root"), fleet.client_key,
+                                           password=password, user_key=user_key,
+                                           try_users=user_key is not None and data.get("login_auto", False))
             old = await services.switch_host(db, fleet, sid, host, host_key)
         except RemoteError as e:
             await state.set_state(ChangeIP.password)
-            text, kb = password_screen(server, host, data["reason"], str(e))
+            text, kb = password_screen(server, host, data["reason"], str(e), data.get("login", "root"),
+                                       data.get("login_auto", False))
             return await panel.edit_text(text, reply_markup=kb)
         await state.clear()
         await after_switch(panel, db, fleet, bot, sid, old)
