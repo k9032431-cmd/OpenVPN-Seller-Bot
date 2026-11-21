@@ -414,3 +414,8 @@ class DB:
         with self.conn:
             self.conn.execute("UPDATE clients SET name=?, value=?, filename=?, status='active', expires_at=?, warned=0"
                               " WHERE id=?", (name, value, filename, expires, cid))
+
+    def set_expiry(self, cid: int, expires_at: Optional[int]) -> None:
+        """Точная дата окончания (None — бессрочно)."""
+        with self.conn:
+            self.conn.execute("UPDATE clients SET expires_at=?, warned=0 WHERE id=?", (expires_at, cid))

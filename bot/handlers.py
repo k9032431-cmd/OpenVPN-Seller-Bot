@@ -14,6 +14,7 @@ import asyncio
 import html
 import math
 import re
+from datetime import datetime, timedelta
 from typing import Optional
 
 from aiogram import Bot, F, Router
@@ -41,6 +42,10 @@ def background(coro) -> None:
     task = asyncio.create_task(coro)
     _background.add(task)
     task.add_done_callback(_background.discard)
+
+
+class KeyTerm(StatesGroup):
+    value = State()     # свой срок для продления / возобновления ключа
 
 
 class NewKey(StatesGroup):
@@ -107,6 +112,37 @@ async def read_secret(m: Message) -> tuple[Optional[str], Optional[bytes], str]:
     if not text.strip():
         return None, None, "Пришлите пароль текстом или SSH-ключ файлом"
     return text, None, ""
+
+
+# ======================= свой срок =======================
+TERM_Q = ("Напишите <b>срок</b>:\n"
+          "• числом дней — <code>4</code>\n"
+          "• или датой окончания — <code>25.12.2026</code> (можно <code>25.12</code>)\n"
+          "• <code>0</code> — бессрочно")
+
+
+def parse_term(text: str) -> tuple[Optional[int], Optional[int], str]:
+    """«4», «4 дня», «25.12.2026», «25.12» → (дней, точная дата окончания или None, ошибка)."""
+    t = (text or "").strip().lower().replace(" ", "")
+    m = re.fullmatch(r"(\d{1,4})(д|дн|дня|дней|день|d|days?)?", t)
+    if m:
+        return int(m[1]), None, ""
+    m = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2}|\d{4}))?", t)
+    if m:
+        now = datetime.now()
+        year = int(m[3]) if m[3] else now.year
+        year += 2000 if year < 100 else 0
+        try:
+            end = datetime(year, int(m[2]), int(m[1]), 23, 59)
+        except ValueError:
+            return None, None, "Такой даты нет"
+        if not m[3] and end < now:          # «25.12», а 25 декабря в этом году уже было
+            end = end.replace(year=year + 1)
+        if end <= now:
+            return None, None, "Эта дата уже прошла"
+        days = max(1, (end - now + timedelta(hours=23)).days)
+        return days, int(end.timestamp()), ""
+    return None, None, "Не понял срок. Напишите число дней (например 4) или дату (например 25.12.2026)"
 
 
 # ======================= роли =======================
@@ -273,11 +309,13 @@ def key_screen(db: DB, c, bot_username: str, scope: str, admin_view: bool, top: 
     if c["status"] != "active":
         renew = [("♻️ 30 дней", f"kn:{i}:30:{scope}"), ("♻️ 90 дней", f"kn:{i}:90:{scope}"),
                  ("♻️ Бессрочно", f"kn:{i}:0:{scope}")]
+        renew_own = [("✏️ Свой срок", f"kt:{i}:ren:{scope}")]
         return screen(f"🔑 {c['name']}", top, info,
                       "<b>♻️ Возобновить ключ</b>\nБот создаст ключ на сервере заново и сам отправит клиенту новый файл."), \
-            ikb(renew, [("🗑 Удалить ключ", f"kd:{i}:{scope}")], back)
+            ikb(renew, renew_own, [("🗑 Удалить ключ", f"kd:{i}:{scope}")], back)
     kb = ikb([("📄 Файл ключа", f"kf:{i}"), ("🔗 Новая ссылка", f"kl:{i}:{scope}")],
              [("+30 дней", f"ke:{i}:30:{scope}"), ("+90 дней", f"ke:{i}:90:{scope}"), ("♾ Бессрочно", f"ke:{i}:0:{scope}")],
+             [("✏️ Свой срок", f"kt:{i}:ext:{scope}")],
              [("⛔ Отключить", f"kr:{i}:{scope}"), ("🗑 Удалить", f"kd:{i}:{scope}")],
              back)
     hint = "Перешлите ссылку клиенту — он нажмёт «Запустить» и получит ключ" if link else ""
@@ -1006,8 +1044,9 @@ def build_staff_router(cfg: Config) -> Router:
 
     NAME_Q = ("Напишите <b>имя ключа</b> латиницей, например <code>ahmet</code>\n"
               "<i>Можно добавить заметку через пробел: ahmet Ахмет +99361234567</i>")
-    DAYS_Q = "На какой срок?\n<i>Нажмите кнопку или напишите число дней</i>"
-    DAYS_ROWS = ([("7 дней", "nd:7"), ("30 дней", "nd:30")], [("90 дней", "nd:90"), ("♾ Бессрочно", "nd:0")])
+    DAYS_Q = "На какой срок?\n<i>Нажмите кнопку или напишите свой срок: число дней (4) или дату (25.12.2026)</i>"
+    DAYS_ROWS = ([("7 дней", "nd:7"), ("30 дней", "nd:30")], [("90 дней", "nd:90"), ("♾ Бессрочно", "nd:0")],
+                 [("✏️ Свой срок", "nd:own")])
 
     @r.callback_query(F.data == "new")
     async def cb_new(cb: CallbackQuery, state: FSMContext, db: DB, role: str, dealer):
@@ -1071,7 +1110,7 @@ def build_staff_router(cfg: Config) -> Router:
         await show(m, *new_key_screen(db, await state.get_data(), DAYS_Q, kb_rows=DAYS_ROWS))
 
     async def create_key(event, state: FSMContext, days: int, db: DB, fleet: Fleet,
-                         bot_username: str, role: str, dealer):
+                         bot_username: str, role: str, dealer, until: Optional[int] = None):
         data = await state.get_data()
         await state.clear()
         server, script, name = db.server(data["sid"]), db.script(data["scid"]), data["name"]
@@ -1093,6 +1132,8 @@ def build_staff_router(cfg: Config) -> Router:
             fleet.busy.discard(server["id"])
         cid = db.add_client(server["id"], script["id"], name, value, filename, days, data.get("note"),
                             dealer_id=dealer["id"] if role == "dealer" else None)
+        if until:   # срок задан датой — ставим точную дату окончания
+            db.set_expiry(cid, until)
         c = db.get(cid)
         scope, _ = resolve_scope(role, dealer)
         text, kb = key_screen(db, c, bot_username, scope, role == "admin", top="✅ Ключ создан")
@@ -1102,21 +1143,24 @@ def build_staff_router(cfg: Config) -> Router:
             live.msg = await open_panel(live.msg.bot, live.msg.chat.id, text, kb)
         await services.send_key(live.msg.bot, live.msg.chat.id, c, texts.KEY_CAPTION)
 
+    @r.callback_query(NewKey.days, F.data == "nd:own")
+    async def new_days_own(cb: CallbackQuery, state: FSMContext, db: DB):
+        await cb.answer()
+        await show(cb, *new_key_screen(db, await state.get_data(), TERM_Q))
+
     @r.callback_query(NewKey.days, F.data.startswith("nd:"))
     async def new_days_cb(cb: CallbackQuery, state: FSMContext, db: DB, fleet: Fleet, bot_username: str,
                           role: str, dealer):
         await cb.answer()
         await create_key(cb, state, int(cb.data[3:]), db, fleet, bot_username, role, dealer)
 
-    @r.message(NewKey.days, F.text.regexp(r"^\d{1,4}$"))
+    @r.message(NewKey.days, F.text)
     async def new_days_text(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot_username: str,
                             role: str, dealer):
-        await create_key(m, state, int(m.text), db, fleet, bot_username, role, dealer)
-
-    @r.message(NewKey.days)
-    async def new_days_bad(m: Message, state: FSMContext, db: DB):
-        await show(m, *new_key_screen(db, await state.get_data(), DAYS_Q,
-                                      "Нажмите кнопку или напишите число дней (0 — бессрочно)", DAYS_ROWS))
+        days, until, error = parse_term(m.text)
+        if error:
+            return await show(m, *new_key_screen(db, await state.get_data(), TERM_Q, error, DAYS_ROWS))
+        await create_key(m, state, days, db, fleet, bot_username, role, dealer, until=until)
 
     # ---------- удаление ключей ----------
     @r.callback_query(F.data.startswith("kd:"))
@@ -1191,31 +1235,82 @@ def build_staff_router(cfg: Config) -> Router:
     @r.callback_query(F.data.startswith("kn:"))
     async def cb_renew(cb: CallbackQuery, db: DB, fleet: Fleet, bot: Bot, bot_username: str, role: str, dealer):
         cid, args, scope = parse(cb, role, dealer)
+        await do_renew(cb, db, fleet, bot, bot_username, role, dealer, cid, scope, int(args[0]), None)
+
+    async def do_renew(event, db: DB, fleet: Fleet, bot: Bot, bot_username: str, role: str, dealer,
+                       cid: int, scope: str, days: int, until_ts: Optional[int]):
+        """Возобновить отключённый ключ на days дней (0 — бессрочно) или до точной даты until_ts."""
+        cb = event if isinstance(event, CallbackQuery) else None
+
+        async def alert(text: str):
+            if cb:
+                return await cb.answer(text, show_alert=True)
+            return await show(event, screen("♻️ Возобновление ключа", f"⚠️ {text}"), ikb(nav(f"k:{cid}:{scope}")))
         c = db.get(cid)
         if not can_manage(role, dealer, c) or c["status"] == "active":
-            return await cb.answer("Ключ не найден или уже активен", show_alert=True)
+            return await alert("Ключ не найден или уже активен")
         if role == "dealer" and db.dealer_slots_left(dealer["id"]) == 0:
             active, _ = db.dealer_counts(dealer["id"])
-            return await cb.answer(f"Лимит ключей исчерпан: {active} из {dealer['key_limit']}", show_alert=True)
+            return await alert(f"Лимит ключей исчерпан: {active} из {dealer['key_limit']}")
         if c["server_id"] in fleet.busy:
-            return await cb.answer("На сервере сейчас идёт операция, попробуйте через минуту", show_alert=True)
-        await cb.answer("Возобновляю…")
+            return await alert("На сервере сейчас идёт операция, попробуйте через минуту")
+        if cb:
+            await cb.answer("Возобновляю…")
         header = screen(f"♻️ Возобновление ключа {c['name']}", fields(("Сервер", name_of(db.server(c["server_id"])))))
-        panel = await show(cb, header)
+        panel = await show(event, header)
         live = Live(panel, header)
         await live("⏳ Подключение к серверу…")
         fleet.busy.add(c["server_id"])
         try:
-            name = await services.renew_key(bot, db, fleet, cid, int(args[0]), live,
+            name = await services.renew_key(bot, db, fleet, cid, days, live,
                                             dealer_text=texts.DEALER_RENEWED if role == "admin" and c["dealer_id"] else None)
         except (*ERRORS, KeyError) as e:
             return await live.fail(str(e), getattr(e, "output", "") if role == "admin" else "",
-                                   ikb([("🔄 Повторить", cb.data)], nav(f"k:{cid}:{scope}")))
+                                   ikb([("🔄 Повторить", f"kn:{cid}:{days}:{scope}")], nav(f"k:{cid}:{scope}")))
         finally:
             fleet.busy.discard(c["server_id"])
+        if until_ts:   # срок задан датой
+            db.set_expiry(cid, until_ts)
         top = "✅ Ключ снова активен" + ("" if name == c["name"] else f" (новое имя: {name})")
         top += " — клиенту отправлен новый файл" if c["tg_id"] else ""
-        await show_key(cb, db, cid, scope, bot_username, role, dealer, top=top)
+        await show_key(event, db, cid, scope, bot_username, role, dealer, top=top)
+
+    # ---------- свой срок (продление / возобновление) ----------
+    @r.callback_query(F.data.startswith("kt:"))
+    async def cb_term(cb: CallbackQuery, state: FSMContext, db: DB, role: str, dealer):
+        _, cid, mode, requested = cb.data.split(":")
+        scope, _ = resolve_scope(role, dealer, requested)
+        c = db.get(int(cid))
+        if not can_manage(role, dealer, c):
+            return await cb.answer("Ключ не найден", show_alert=True)
+        await cb.answer()
+        await state.set_state(KeyTerm.value)
+        await state.update_data(cid=c["id"], mode=mode, scope=scope)
+        title = "♻️ Возобновить ключ" if mode == "ren" else "✏️ Продлить ключ"
+        extra = ("<i>Число дней добавится к текущему сроку, дата — станет новой датой окончания</i>"
+                 if mode == "ext" else None)
+        await show(cb, screen(f"{title} {c['name']}", fields(("Сейчас", services.fmt_until(c["expires_at"]))),
+                              TERM_Q, extra), ikb(nav(f"k:{c['id']}:{scope}")))
+
+    @r.message(KeyTerm.value, F.text)
+    async def term_text(m: Message, state: FSMContext, db: DB, fleet: Fleet, bot: Bot, bot_username: str,
+                        role: str, dealer):
+        data = await state.get_data()
+        c = db.get(data["cid"])
+        days, until_ts, error = parse_term(m.text)
+        if error:
+            title = "♻️ Возобновить ключ" if data["mode"] == "ren" else "✏️ Продлить ключ"
+            return await show(m, screen(f"{title} {c['name'] if c else ''}", TERM_Q, f"⚠️ {error}"),
+                              ikb(nav(f"k:{data['cid']}:{data['scope']}")))
+        await state.clear()
+        if not can_manage(role, dealer, c):
+            return await show(m, screen("🔑 Ключ не найден"), ikb(nav()))
+        if data["mode"] == "ren":
+            return await do_renew(m, db, fleet, bot, bot_username, role, dealer, c["id"], data["scope"], days, until_ts)
+        if c["status"] != "active":
+            return await show(m, screen("🔑 Ключ отключён", "Используйте «♻️ Возобновить»."),
+                              ikb(nav(f"k:{c['id']}:{data['scope']}")))
+        await do_extend(m, db, bot, bot_username, role, dealer, c, data["scope"], days, until_ts)
 
     # ---------- пользователи ----------
     @r.callback_query(F.data.startswith("ul:"))
@@ -1358,13 +1453,23 @@ def build_staff_router(cfg: Config) -> Router:
         c = db.get(cid)
         if not can_manage(role, dealer, c) or c["status"] != "active":
             return await cb.answer("Ключ не активен", show_alert=True)
-        until = services.fmt_until(db.extend(cid, int(args[0])))
         await cb.answer("Продлено")
+        await do_extend(cb, db, bot, bot_username, role, dealer, c, scope, int(args[0]), None)
+
+    async def do_extend(event, db: DB, bot: Bot, bot_username: str, role: str, dealer, c, scope: str,
+                        days: int, until_ts: Optional[int]):
+        """Продлить активный ключ: на days дней (0 — бессрочно) или до точной даты until_ts."""
+        cid = c["id"]
+        if until_ts:
+            db.set_expiry(cid, until_ts)
+            until = services.fmt_until(until_ts)
+        else:
+            until = services.fmt_until(db.extend(cid, days))
         if c["tg_id"]:
             await services.safe_send(bot, c["tg_id"], texts.EXTENDED_USER.format(name=c["name"], until=until))
         if role == "admin" and c["dealer_id"]:
             await services.tell_dealer(bot, db, c, texts.DEALER_EXTENDED.format(name=c["name"], until=until))
-        await show_key(cb, db, cid, scope, bot_username, role, dealer, top=f"✅ Продлено: {until}")
+        await show_key(event, db, cid, scope, bot_username, role, dealer, top=f"✅ Срок: {until}")
 
     @r.callback_query(F.data.startswith("kr:"))
     async def cb_revoke_ask(cb: CallbackQuery, db: DB, role: str, dealer):

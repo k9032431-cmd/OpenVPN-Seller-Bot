@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Optional
@@ -259,7 +260,8 @@ async def renew_key(bot: Bot, db: DB, fleet: Fleet, cid: int, days: int, progres
     script = db.script(c["script_id"]) or next(iter(db.scripts(only_enabled=True)), None)
     if server is None or script is None:
         raise engine.EngineError("Сервер или скрипт этого ключа удалён — создайте новый ключ")
-    candidates = [c["name"]] + [f"{c['name'][:28]}-{n}" for n in range(2, 7)]
+    base = re.sub(r"-\d+$", "", c["name"])[:28]          # ahmet-2 → ahmet, чтобы дальше было ahmet-3, а не ahmet-2-2
+    candidates = [c["name"]] + [n for n in (f"{base}-{i}" for i in range(2, 12)) if n != c["name"]]
     last: Exception = engine.EngineError("Не удалось создать ключ")
     for name in candidates:
         if name != c["name"] and db.name_taken(server["id"], name):
